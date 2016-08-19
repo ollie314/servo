@@ -23,14 +23,14 @@
             % endfor
 
             loop {
-                if background_color.is_none() {
-                    if let Ok(value) = input.try(|input| background_color::parse(context, input)) {
+                if let Ok(value) = input.try(|input| background_color::parse(context, input)) {
+                    if background_color.is_none() {
                         background_color = Some(value);
                         continue
+                    } else {
+                        // color can only be the last element
+                        return Err(())
                     }
-                } else {
-                    // color can only be the last element
-                    return Err(())
                 }
                 if position.is_none() {
                     if let Ok(value) = input.try(|input| background_position::single_value::parse(context, input)) {
