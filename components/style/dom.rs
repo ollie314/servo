@@ -9,11 +9,11 @@
 use context::SharedStyleContext;
 use data::PrivateStyleData;
 use element_state::ElementState;
-use properties::{ComputedValues, PropertyDeclaration, PropertyDeclarationBlock};
+use properties::{ComputedValues, PropertyDeclarationBlock};
 use refcell::{Ref, RefMut};
 use restyle_hints::{RESTYLE_DESCENDANTS, RESTYLE_LATER_SIBLINGS, RESTYLE_SELF, RestyleHint};
 use selector_impl::{ElementExt, PseudoElement};
-use selectors::matching::DeclarationBlock;
+use selector_matching::ApplicableDeclarationBlock;
 use sink::Push;
 use std::fmt::Debug;
 use std::ops::BitOr;
@@ -64,41 +64,47 @@ pub trait TRestyleDamage : Debug + PartialEq + BitOr<Output=Self> + Copy {
     fn rebuild_and_reflow() -> Self;
 }
 
-pub trait TNode : Sized + Copy + Clone {
+/// Simple trait to provide basic information about the type of an element.
+///
+/// We avoid exposing the full type id, since computing it in the general case
+/// would be difficult for Gecko nodes.
+pub trait NodeInfo {
+    fn is_element(&self) -> bool;
+    fn is_text_node(&self) -> bool;
+
+    // Comments, doctypes, etc are ignored by layout algorithms.
+    fn needs_layout(&self) -> bool { self.is_element() || self.is_text_node() }
+}
+
+pub struct LayoutIterator<T>(pub T);
+impl<T, I> Iterator for LayoutIterator<T> where T: Iterator<Item=I>, I: NodeInfo {
+    type Item = I;
+    fn next(&mut self) -> Option<I> {
+        loop {
+            // Filter out nodes that layout should ignore.
+            let n = self.0.next();
+            if n.is_none() || n.as_ref().unwrap().needs_layout() {
+                return n
+            }
+        }
+    }
+}
+
+pub trait TNode : Sized + Copy + Clone + NodeInfo {
     type ConcreteElement: TElement<ConcreteNode = Self, ConcreteDocument = Self::ConcreteDocument>;
     type ConcreteDocument: TDocument<ConcreteNode = Self, ConcreteElement = Self::ConcreteElement>;
     type ConcreteRestyleDamage: TRestyleDamage;
+    type ConcreteChildrenIterator: Iterator<Item = Self>;
 
     fn to_unsafe(&self) -> UnsafeNode;
     unsafe fn from_unsafe(n: &UnsafeNode) -> Self;
-
-    /// Returns whether this is a text node. It turns out that this is all the style system cares
-    /// about, and thus obviates the need to compute the full type id, which would be expensive in
-    /// Gecko.
-    fn is_text_node(&self) -> bool;
-
-    fn is_element(&self) -> bool;
 
     fn dump(self);
 
     fn dump_style(self);
 
-    fn traverse_preorder(self) -> TreeIterator<Self> {
-        TreeIterator::new(self)
-    }
-
     /// Returns an iterator over this node's children.
-    fn children(self) -> ChildrenIterator<Self> {
-        ChildrenIterator {
-            current: self.first_child(),
-        }
-    }
-
-    fn rev_children(self) -> ReverseChildrenIterator<Self> {
-        ReverseChildrenIterator {
-            current: self.last_child(),
-        }
-    }
+    fn children(self) -> LayoutIterator<Self::ConcreteChildrenIterator>;
 
     /// Converts self into an `OpaqueNode`.
     fn opaque(&self) -> OpaqueNode;
@@ -112,8 +118,6 @@ pub trait TNode : Sized + Copy + Clone {
     fn as_element(&self) -> Option<Self::ConcreteElement>;
 
     fn as_document(&self) -> Option<Self::ConcreteDocument>;
-
-    fn children_count(&self) -> u32;
 
     fn has_changed(&self) -> bool;
 
@@ -194,20 +198,23 @@ pub trait TDocument : Sized + Copy + Clone {
 
     fn drain_modified_elements(&self) -> Vec<(Self::ConcreteElement,
                                               <Self::ConcreteElement as ElementExt>::Snapshot)>;
+
+    fn needs_paint_from_layout(&self);
+    fn will_paint(&self);
 }
 
 pub trait PresentationalHintsSynthetizer {
     fn synthesize_presentational_hints_for_legacy_attributes<V>(&self, hints: &mut V)
-        where V: Push<DeclarationBlock<Vec<PropertyDeclaration>>>;
+        where V: Push<ApplicableDeclarationBlock>;
 }
 
-pub trait TElement : PartialEq + Sized + Copy + Clone + ElementExt + PresentationalHintsSynthetizer {
+pub trait TElement : PartialEq + Debug + Sized + Copy + Clone + ElementExt + PresentationalHintsSynthetizer {
     type ConcreteNode: TNode<ConcreteElement = Self, ConcreteDocument = Self::ConcreteDocument>;
     type ConcreteDocument: TDocument<ConcreteNode = Self::ConcreteNode, ConcreteElement = Self>;
 
     fn as_node(&self) -> Self::ConcreteNode;
 
-    fn style_attribute(&self) -> &Option<PropertyDeclarationBlock>;
+    fn style_attribute(&self) -> Option<&Arc<PropertyDeclarationBlock>>;
 
     fn get_state(&self) -> ElementState;
 
@@ -252,61 +259,5 @@ pub trait TElement : PartialEq + Sized + Copy + Clone + ElementExt + Presentatio
                 next = ::selectors::Element::next_sibling_element(&sib);
             }
         }
-    }
-}
-
-pub struct TreeIterator<ConcreteNode> where ConcreteNode: TNode {
-    stack: Vec<ConcreteNode>,
-}
-
-impl<ConcreteNode> TreeIterator<ConcreteNode> where ConcreteNode: TNode {
-    fn new(root: ConcreteNode) -> TreeIterator<ConcreteNode> {
-        let mut stack = vec![];
-        stack.push(root);
-        TreeIterator {
-            stack: stack,
-        }
-    }
-
-    pub fn next_skipping_children(&mut self) -> Option<ConcreteNode> {
-        self.stack.pop()
-    }
-}
-
-impl<ConcreteNode> Iterator for TreeIterator<ConcreteNode>
-                            where ConcreteNode: TNode {
-    type Item = ConcreteNode;
-    fn next(&mut self) -> Option<ConcreteNode> {
-        let ret = self.stack.pop();
-        ret.map(|node| self.stack.extend(node.rev_children()));
-        ret
-    }
-}
-
-pub struct ChildrenIterator<ConcreteNode> where ConcreteNode: TNode {
-    current: Option<ConcreteNode>,
-}
-
-impl<ConcreteNode> Iterator for ChildrenIterator<ConcreteNode>
-                            where ConcreteNode: TNode {
-    type Item = ConcreteNode;
-    fn next(&mut self) -> Option<ConcreteNode> {
-        let node = self.current;
-        self.current = node.and_then(|node| node.next_sibling());
-        node
-    }
-}
-
-pub struct ReverseChildrenIterator<ConcreteNode> where ConcreteNode: TNode {
-    current: Option<ConcreteNode>,
-}
-
-impl<ConcreteNode> Iterator for ReverseChildrenIterator<ConcreteNode>
-                            where ConcreteNode: TNode {
-    type Item = ConcreteNode;
-    fn next(&mut self) -> Option<ConcreteNode> {
-        let node = self.current;
-        self.current = node.and_then(|node| node.prev_sibling());
-        node
     }
 }

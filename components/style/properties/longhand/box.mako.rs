@@ -115,12 +115,17 @@ ${helpers.single_keyword("position", "static absolute relative fixed",
                 *self
             }
         }
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> SpecifiedValue {
+          *computed
+        }
     }
 
 </%helpers:single_keyword_computed>
 
 ${helpers.single_keyword("clear", "none left right both",
-                         animatable=False, gecko_ffi_name="mBreakType")}
+                         animatable=False, gecko_ffi_name="mBreakType",
+                         gecko_enum_prefix="StyleClear")}
 
 <%helpers:longhand name="-servo-display-for-hypothetical-box"
                    animatable="False"
@@ -239,6 +244,20 @@ ${helpers.single_keyword("clear", "none left right both",
                   computed_value::T::LengthOrPercentage(value.to_computed_value(context)),
           }
       }
+      #[inline]
+      fn from_computed_value(computed: &computed_value::T) -> Self {
+          match *computed {
+              % for keyword in vertical_align_keywords:
+                  computed_value::T::${to_rust_ident(keyword)} => {
+                      SpecifiedValue::${to_rust_ident(keyword)}
+                  }
+              % endfor
+              computed_value::T::LengthOrPercentage(value) =>
+                  SpecifiedValue::LengthOrPercentage(
+                    ToComputedValue::from_computed_value(&value)
+                  ),
+          }
+      }
   }
 </%helpers:longhand>
 
@@ -265,6 +284,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
   use cssparser::ToCss;
   use std::fmt;
+  use values::computed::ComputedValueAsSpecified;
 
   pub use self::computed_value::T as SpecifiedValue;
 
@@ -283,14 +303,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
       pub struct T(pub super::super::overflow_x::computed_value::T);
   }
 
-  impl ToComputedValue for SpecifiedValue {
-      type ComputedValue = computed_value::T;
-
-      #[inline]
-      fn to_computed_value(&self, context: &Context) -> computed_value::T {
-          computed_value::T(self.0.to_computed_value(context))
-      }
-  }
+  impl ComputedValueAsSpecified for SpecifiedValue {}
 
   pub fn get_initial_value() -> computed_value::T {
       computed_value::T(overflow_x::get_initial_value())
@@ -371,6 +384,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
     use euclid::point::{Point2D, TypedPoint2D};
     use std::marker::PhantomData;
+    use values::computed::ComputedValueAsSpecified;
 
     pub use self::computed_value::SingleComputedValue as SingleSpecifiedValue;
     pub use self::computed_value::T as SpecifiedValue;
@@ -415,6 +429,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
         use cssparser::ToCss;
         use euclid::point::Point2D;
         use std::fmt;
+        use values::computed::ComputedValueAsSpecified;
 
         pub use self::TransitionTimingFunction as SingleComputedValue;
 
@@ -489,14 +504,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
     use values::NoViewportPercentage;
     impl NoViewportPercentage for SpecifiedValue {}
 
-    impl ToComputedValue for SpecifiedValue {
-        type ComputedValue = computed_value::T;
-
-        #[inline]
-        fn to_computed_value(&self, _: &Context) -> computed_value::T {
-            (*self).clone()
-        }
-    }
+    impl ComputedValueAsSpecified for SpecifiedValue {}
 
     #[inline]
     pub fn get_initial_value() -> computed_value::T {
@@ -566,6 +574,9 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 <%helpers:longhand name="transition-property"
                    need_index="True"
                    animatable="False">
+
+    use values::computed::ComputedValueAsSpecified;
+
     pub use self::computed_value::SingleComputedValue as SingleSpecifiedValue;
     pub use self::computed_value::T as SpecifiedValue;
 
@@ -615,14 +626,7 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
     use values::NoViewportPercentage;
     impl NoViewportPercentage for SpecifiedValue {}
 
-    impl ToComputedValue for SpecifiedValue {
-        type ComputedValue = computed_value::T;
-
-        #[inline]
-        fn to_computed_value(&self, _: &Context) -> computed_value::T {
-            (*self).clone()
-        }
-    }
+    impl ComputedValueAsSpecified for SpecifiedValue { }
 </%helpers:longhand>
 
 <%helpers:longhand name="transition-delay"
@@ -636,7 +640,8 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
 <%helpers:longhand name="animation-name"
                    need_index="True"
-                   animatable="False">
+                   animatable="False",
+                   allowed_in_keyframe_block="False">
     use values::computed::ComputedValueAsSpecified;
     use values::NoViewportPercentage;
 
@@ -699,7 +704,8 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
 <%helpers:longhand name="animation-duration"
                    need_index="True"
-                   animatable="False">
+                   animatable="False",
+                   allowed_in_keyframe_block="False">
     pub use super::transition_duration::computed_value;
     pub use super::transition_duration::{get_initial_value, get_initial_single_value};
     pub use super::transition_duration::{parse, parse_one};
@@ -709,7 +715,8 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
 <%helpers:longhand name="animation-timing-function"
                    need_index="True"
-                   animatable="False">
+                   animatable="False",
+                   allowed_in_keyframe_block="False">
     pub use super::transition_timing_function::computed_value;
     pub use super::transition_timing_function::{get_initial_value, get_initial_single_value};
     pub use super::transition_timing_function::{parse, parse_one};
@@ -719,7 +726,8 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 
 <%helpers:longhand name="animation-iteration-count"
                    need_index="True"
-                   animatable="False">
+                   animatable="False",
+                   allowed_in_keyframe_block="False">
     use values::computed::ComputedValueAsSpecified;
     use values::NoViewportPercentage;
 
@@ -804,22 +812,28 @@ ${helpers.single_keyword("overflow-x", "visible hidden scroll auto",
 ${helpers.keyword_list("animation-direction",
                        "normal reverse alternate alternate-reverse",
                        need_index=True,
-                       animatable=False)}
+                       animatable=False,
+                       allowed_in_keyframe_block=False)}
 
+// animation-play-state is the exception to the rule for allowed_in_keyframe_block:
+// https://drafts.csswg.org/css-animations/#keyframes
 ${helpers.keyword_list("animation-play-state",
                        "running paused",
                        need_clone=True,
                        need_index=True,
-                       animatable=False)}
+                       animatable=False,
+                       allowed_in_keyframe_block=True)}
 
 ${helpers.keyword_list("animation-fill-mode",
                        "none forwards backwards both",
                        need_index=True,
-                       animatable=False)}
+                       animatable=False,
+                       allowed_in_keyframe_block=False)}
 
 <%helpers:longhand name="animation-delay"
                    need_index="True"
-                   animatable="False">
+                   animatable="False",
+                   allowed_in_keyframe_block="False">
     pub use super::transition_duration::computed_value;
     pub use super::transition_duration::{get_initial_value, get_initial_single_value};
     pub use super::transition_duration::{parse, parse_one};

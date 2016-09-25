@@ -9,14 +9,14 @@ use context::SharedStyleContext;
 use dom::OpaqueNode;
 use euclid::point::Point2D;
 use keyframes::{KeyframesStep, KeyframesStepValue};
+use properties::{self, ComputedValues, Importance};
 use properties::animated_properties::{AnimatedProperty, TransitionProperty};
 use properties::longhands::animation_direction::computed_value::AnimationDirection;
 use properties::longhands::animation_iteration_count::computed_value::AnimationIterationCount;
 use properties::longhands::animation_play_state::computed_value::AnimationPlayState;
 use properties::longhands::transition_timing_function::computed_value::StartEnd;
 use properties::longhands::transition_timing_function::computed_value::TransitionTimingFunction;
-use properties::{self, ComputedValues};
-use selectors::matching::DeclarationBlock;
+use selector_matching::ApplicableDeclarationBlock;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use string_cache::Atom;
@@ -384,8 +384,9 @@ fn compute_style_for_animation_step(context: &SharedStyleContext,
         // an Arc in the below (more common case).
         KeyframesStepValue::ComputedValues => style_from_cascade.clone(),
         KeyframesStepValue::Declarations(ref declarations) => {
-            let declaration_block = DeclarationBlock {
-                declarations: declarations.clone(),
+            let declaration_block = ApplicableDeclarationBlock {
+                mixed_declarations: declarations.clone(),
+                importance: Importance::Normal,
                 source_order: 0,
                 specificity: ::std::u32::MAX,
             };
@@ -685,4 +686,3 @@ pub fn complete_expired_transitions(node: OpaqueNode, style: &mut Arc<ComputedVa
 
     had_animations_to_expire
 }
-

@@ -10,16 +10,16 @@ use animation;
 use arc_ptr_eq;
 use cache::{LRUCache, SimpleHashCache};
 use cascade_info::CascadeInfo;
-use context::{StyleContext, SharedStyleContext};
+use context::{SharedStyleContext, StyleContext};
 use data::PrivateStyleData;
-use dom::{TElement, TNode, TRestyleDamage, UnsafeNode};
+use dom::{NodeInfo, TElement, TNode, TRestyleDamage, UnsafeNode};
+use properties::{ComputedValues, PropertyDeclarationBlock, cascade};
 use properties::longhands::display::computed_value as display;
-use properties::{ComputedValues, PropertyDeclaration, cascade};
-use selector_impl::{TheSelectorImpl, PseudoElement};
-use selector_matching::{DeclarationBlock, Stylist};
-use selectors::bloom::BloomFilter;
-use selectors::matching::{StyleRelations, AFFECTED_BY_PSEUDO_ELEMENTS};
+use selector_impl::{PseudoElement, TheSelectorImpl};
+use selector_matching::{ApplicableDeclarationBlock, Stylist};
 use selectors::{Element, MatchAttr};
+use selectors::bloom::BloomFilter;
+use selectors::matching::{AFFECTED_BY_PSEUDO_ELEMENTS, MatchingReason, StyleRelations};
 use sink::ForgetfulSink;
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -51,9 +51,9 @@ fn create_common_style_affecting_attributes_from_element<E: TElement>(element: &
 }
 
 pub struct ApplicableDeclarations {
-    pub normal: SmallVec<[DeclarationBlock; 16]>,
+    pub normal: SmallVec<[ApplicableDeclarationBlock; 16]>,
     pub per_pseudo: HashMap<PseudoElement,
-                            Vec<DeclarationBlock>,
+                            Vec<ApplicableDeclarationBlock>,
                             BuildHasherDefault<::fnv::FnvHasher>>,
 
     /// Whether the `normal` declarations are shareable with other nodes.
@@ -78,11 +78,11 @@ impl ApplicableDeclarations {
 
 #[derive(Clone)]
 pub struct ApplicableDeclarationsCacheEntry {
-    pub declarations: Vec<DeclarationBlock>,
+    pub declarations: Vec<ApplicableDeclarationBlock>,
 }
 
 impl ApplicableDeclarationsCacheEntry {
-    fn new(declarations: Vec<DeclarationBlock>) -> ApplicableDeclarationsCacheEntry {
+    fn new(declarations: Vec<ApplicableDeclarationBlock>) -> ApplicableDeclarationsCacheEntry {
         ApplicableDeclarationsCacheEntry {
             declarations: declarations,
         }
@@ -105,11 +105,11 @@ impl Hash for ApplicableDeclarationsCacheEntry {
 }
 
 struct ApplicableDeclarationsCacheQuery<'a> {
-    declarations: &'a [DeclarationBlock],
+    declarations: &'a [ApplicableDeclarationBlock],
 }
 
 impl<'a> ApplicableDeclarationsCacheQuery<'a> {
-    fn new(declarations: &'a [DeclarationBlock]) -> ApplicableDeclarationsCacheQuery<'a> {
+    fn new(declarations: &'a [ApplicableDeclarationBlock]) -> ApplicableDeclarationsCacheQuery<'a> {
         ApplicableDeclarationsCacheQuery {
             declarations: declarations,
         }
@@ -118,15 +118,11 @@ impl<'a> ApplicableDeclarationsCacheQuery<'a> {
 
 impl<'a> PartialEq for ApplicableDeclarationsCacheQuery<'a> {
     fn eq(&self, other: &ApplicableDeclarationsCacheQuery<'a>) -> bool {
-        if self.declarations.len() != other.declarations.len() {
-            return false
-        }
-        for (this, other) in self.declarations.iter().zip(other.declarations) {
-            if !arc_ptr_eq(&this.declarations, &other.declarations) {
-                return false
-            }
-        }
-        true
+        self.declarations.len() == other.declarations.len() &&
+        self.declarations.iter().zip(other.declarations).all(|(this, other)| {
+            arc_ptr_eq(&this.mixed_declarations, &other.mixed_declarations) &&
+            this.importance == other.importance
+        })
     }
 }
 impl<'a> Eq for ApplicableDeclarationsCacheQuery<'a> {}
@@ -143,8 +139,9 @@ impl<'a> Hash for ApplicableDeclarationsCacheQuery<'a> {
         for declaration in self.declarations {
             // Each declaration contians an Arc, which is a stable
             // pointer; we use that for hashing and equality.
-            let ptr = &*declaration.declarations as *const Vec<PropertyDeclaration>;
+            let ptr: *const PropertyDeclarationBlock = &*declaration.mixed_declarations;
             ptr.hash(state);
+            declaration.importance.hash(state);
         }
     }
 }
@@ -162,14 +159,14 @@ impl ApplicableDeclarationsCache {
         }
     }
 
-    pub fn find(&self, declarations: &[DeclarationBlock]) -> Option<Arc<ComputedValues>> {
+    pub fn find(&self, declarations: &[ApplicableDeclarationBlock]) -> Option<Arc<ComputedValues>> {
         match self.cache.find(&ApplicableDeclarationsCacheQuery::new(declarations)) {
             None => None,
             Some(ref values) => Some((*values).clone()),
         }
     }
 
-    pub fn insert(&mut self, declarations: Vec<DeclarationBlock>, style: Arc<ComputedValues>) {
+    pub fn insert(&mut self, declarations: Vec<ApplicableDeclarationBlock>, style: Arc<ComputedValues>) {
         self.cache.insert(ApplicableDeclarationsCacheEntry::new(declarations), style)
     }
 
@@ -189,6 +186,8 @@ struct StyleSharingCandidate {
     style: Arc<ComputedValues>,
     /// The cached common style affecting attribute info.
     common_style_affecting_attributes: Option<CommonStyleAffectingAttributes>,
+    /// the cached class names.
+    class_attributes: Option<Vec<Atom>>,
 }
 
 impl PartialEq<StyleSharingCandidate> for StyleSharingCandidate {
@@ -268,7 +267,7 @@ fn element_matches_candidate<E: TElement>(element: &E,
         miss!(StyleAttr)
     }
 
-    if !have_same_class(element, candidate_element) {
+    if !have_same_class(element, candidate, candidate_element) {
         miss!(Class)
     }
 
@@ -376,15 +375,20 @@ pub fn rare_style_affecting_attributes() -> [Atom; 3] {
     [ atom!("bgcolor"), atom!("border"), atom!("colspan") ]
 }
 
-fn have_same_class<E: TElement>(element: &E, candidate: &E) -> bool {
+fn have_same_class<E: TElement>(element: &E,
+                                candidate: &mut StyleSharingCandidate,
+                                candidate_element: &E) -> bool {
     // XXX Efficiency here, I'm only validating ideas.
-    let mut first = vec![];
-    let mut second = vec![];
+    let mut element_class_attributes = vec![];
+    element.each_class(|c| element_class_attributes.push(c.clone()));
 
-    element.each_class(|c| first.push(c.clone()));
-    candidate.each_class(|c| second.push(c.clone()));
+    if candidate.class_attributes.is_none() {
+        let mut attrs = vec![];
+        candidate_element.each_class(|c| attrs.push(c.clone()));
+        candidate.class_attributes = Some(attrs)
+    }
 
-    first == second
+    element_class_attributes == *candidate.class_attributes.as_ref().unwrap()
 }
 
 // TODO: These re-match the candidate every time, which is suboptimal.
@@ -457,6 +461,7 @@ impl StyleSharingCandidateCache {
             node: node.to_unsafe(),
             style: style.clone(),
             common_style_affecting_attributes: None,
+            class_attributes: None,
         }, ());
     }
 
@@ -488,7 +493,7 @@ trait PrivateMatchMethods: TNode {
     fn cascade_node_pseudo_element<'a, Ctx>(&self,
                                             context: &Ctx,
                                             parent_style: Option<&Arc<ComputedValues>>,
-                                            applicable_declarations: &[DeclarationBlock],
+                                            applicable_declarations: &[ApplicableDeclarationBlock],
                                             mut old_style: Option<&mut Arc<ComputedValues>>,
                                             applicable_declarations_cache:
                                              &mut ApplicableDeclarationsCache,
@@ -646,14 +651,15 @@ pub trait ElementMatchMethods : TElement {
                      applicable_declarations: &mut ApplicableDeclarations)
                      -> StyleRelations {
         use traversal::relations_are_shareable;
-        let style_attribute = self.style_attribute().as_ref();
+        let style_attribute = self.style_attribute();
 
         let mut relations =
             stylist.push_applicable_declarations(self,
                                                  parent_bf,
                                                  style_attribute,
                                                  None,
-                                                 &mut applicable_declarations.normal);
+                                                 &mut applicable_declarations.normal,
+                                                 MatchingReason::ForStyling);
 
         applicable_declarations.normal_shareable = relations_are_shareable(&relations);
 
@@ -662,7 +668,8 @@ pub trait ElementMatchMethods : TElement {
                                                  parent_bf,
                                                  None,
                                                  Some(&pseudo.clone()),
-                                                 applicable_declarations.per_pseudo.entry(pseudo).or_insert(vec![]));
+                                                 applicable_declarations.per_pseudo.entry(pseudo).or_insert(vec![]),
+                                                 MatchingReason::ForStyling);
         });
 
         let has_pseudos =
@@ -701,6 +708,7 @@ pub trait ElementMatchMethods : TElement {
             _ => return StyleSharingResult::CannotShare,
         };
 
+        let mut should_clear_cache = false;
         for (i, &mut (ref mut candidate, ())) in style_sharing_candidate_cache.iter_mut().enumerate() {
             let sharing_result = self.share_style_with_candidate_if_possible(parent,
                                                                              shared_context,
@@ -743,6 +751,11 @@ pub trait ElementMatchMethods : TElement {
                     // Cache miss, let's see what kind of failure to decide
                     // whether we keep trying or not.
                     match miss {
+                        // Cache miss because of parent, clear the candidate cache.
+                        CacheMiss::Parent => {
+                            should_clear_cache = true;
+                            break;
+                        },
                         // Too expensive failure, give up, we don't want another
                         // one of these.
                         CacheMiss::CommonStyleAffectingAttributes |
@@ -753,6 +766,9 @@ pub trait ElementMatchMethods : TElement {
                     }
                 }
             }
+        }
+        if should_clear_cache {
+            style_sharing_candidate_cache.clear();
         }
 
         StyleSharingResult::CannotShare
@@ -871,21 +887,29 @@ pub trait MatchMethods : TNode {
             None => None,
         };
 
-        let mut applicable_declarations_cache =
-            context.local_context().applicable_declarations_cache.borrow_mut();
 
-        let (damage, restyle_result) = if self.is_text_node() {
+        // In the case we're styling a text node, we don't need to compute the
+        // restyle damage, since it's a subset of the restyle damage of the
+        // parent.
+        //
+        // In Gecko, we're done, we don't need anything else from text nodes.
+        //
+        // In Servo, this is also true, since text nodes generate UnscannedText
+        // fragments, which aren't repairable by incremental layout.
+        if self.is_text_node() {
             let mut data_ref = self.mutate_data().unwrap();
             let mut data = &mut *data_ref;
             let cloned_parent_style = ComputedValues::style_for_child_text_node(parent_style.unwrap());
 
-            let damage =
-                self.compute_restyle_damage(data.style.as_ref(), &cloned_parent_style, None);
-
             data.style = Some(cloned_parent_style);
 
-            (damage, RestyleResult::Continue)
-        } else {
+            return RestyleResult::Continue;
+        }
+
+        let mut applicable_declarations_cache =
+            context.local_context().applicable_declarations_cache.borrow_mut();
+
+        let (damage, restyle_result) = {
             let mut data_ref = self.mutate_data().unwrap();
             let mut data = &mut *data_ref;
             let final_style =

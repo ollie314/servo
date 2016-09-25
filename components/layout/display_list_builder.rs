@@ -10,26 +10,26 @@
 
 #![deny(unsafe_code)]
 
-use app_units::{Au, AU_PER_PX};
+use app_units::{AU_PER_PX, Au};
 use azure::azure_hl::Color;
 use block::{BlockFlow, BlockStackingContextType};
-use canvas_traits::{CanvasMsg, CanvasData, FromLayoutMsg};
-use context::LayoutContext;
-use euclid::{Matrix4D, Point2D, Point3D, Rect, SideOffsets2D, Size2D};
+use canvas_traits::{CanvasData, CanvasMsg, FromLayoutMsg};
+use context::SharedLayoutContext;
+use euclid::{Matrix4D, Point2D, Point3D, Radians, Rect, SideOffsets2D, Size2D};
 use flex::FlexFlow;
 use flow::{BaseFlow, Flow, IS_ABSOLUTELY_POSITIONED};
 use flow_ref;
-use fragment::SpecificFragmentInfo;
 use fragment::{CoordinateSystem, Fragment, HAS_LAYER, ImageFragmentInfo, ScannedTextFragmentInfo};
+use fragment::SpecificFragmentInfo;
 use gfx::display_list::{BLUR_INFLATION_FACTOR, BaseDisplayItem, BorderDisplayItem};
 use gfx::display_list::{BorderRadii, BoxShadowClipMode, BoxShadowDisplayItem, ClippingRegion};
 use gfx::display_list::{DisplayItem, DisplayItemMetadata, DisplayListSection, GradientDisplayItem};
 use gfx::display_list::{GradientStop, IframeDisplayItem, ImageDisplayItem, WebGLDisplayItem};
-use gfx::display_list::{LayeredItem, LayerInfo, LineDisplayItem, OpaqueNode};
+use gfx::display_list::{LayerInfo, LayeredItem, LineDisplayItem, OpaqueNode};
 use gfx::display_list::{SolidColorDisplayItem, StackingContext, StackingContextType};
 use gfx::display_list::{TextDisplayItem, TextOrientation, WebRenderImageInfo};
 use gfx::paint_thread::THREAD_TINT_COLORS;
-use gfx_traits::{color, ScrollPolicy, StackingContextId};
+use gfx_traits::{ScrollPolicy, StackingContextId, color};
 use inline::{FIRST_FRAGMENT_OF_ELEMENT, InlineFlow, LAST_FRAGMENT_OF_ELEMENT};
 use ipc_channel::ipc;
 use list_item::ListItemFlow;
@@ -38,19 +38,19 @@ use net_traits::image::base::PixelFormat;
 use net_traits::image_cache_thread::UsePlaceholder;
 use range::Range;
 use script_layout_interface::restyle_damage::REPAINT;
+use std::{cmp, f32};
 use std::default::Default;
 use std::sync::Arc;
-use std::{cmp, f32};
-use style::computed_values::filter::Filter;
-use style::computed_values::text_shadow::TextShadow;
-use style::computed_values::{_servo_overflow_clip_box as overflow_clip_box};
 use style::computed_values::{background_attachment, background_clip, background_origin};
 use style::computed_values::{background_repeat, background_size, border_style};
 use style::computed_values::{cursor, image_rendering, overflow_x, pointer_events, position};
 use style::computed_values::{transform, transform_style, visibility};
+use style::computed_values::_servo_overflow_clip_box as overflow_clip_box;
+use style::computed_values::filter::Filter;
+use style::computed_values::text_shadow::TextShadow;
 use style::logical_geometry::{LogicalPoint, LogicalRect, LogicalSize, WritingMode};
-use style::properties::style_structs;
 use style::properties::{self, ServoComputedValues};
+use style::properties::style_structs;
 use style::values::RGBA;
 use style::values::computed;
 use style::values::computed::{LengthOrNone, LengthOrPercentage, LengthOrPercentageOrAuto, LinearGradient};
@@ -60,17 +60,22 @@ use table_cell::CollapsedBordersForCell;
 use url::Url;
 use util::opts;
 
+fn get_cyclic<T>(arr: &[T], index: usize) -> &T {
+    &arr[index % arr.len()]
+}
+
 pub struct DisplayListBuildState<'a> {
-    pub layout_context: &'a LayoutContext<'a>,
+    pub shared_layout_context: &'a SharedLayoutContext,
     pub items: Vec<DisplayItem>,
     pub stacking_context_id_stack: Vec<StackingContextId>,
 }
 
 impl<'a> DisplayListBuildState<'a> {
-    pub fn new(layout_context: &'a LayoutContext, stacking_context_id: StackingContextId)
+    pub fn new(shared_layout_context: &'a SharedLayoutContext,
+               stacking_context_id: StackingContextId)
                -> DisplayListBuildState<'a> {
         DisplayListBuildState {
-            layout_context: layout_context,
+            shared_layout_context: shared_layout_context,
             items: Vec::new(),
             stacking_context_id_stack: vec!(stacking_context_id),
         }
@@ -146,7 +151,7 @@ pub trait FragmentDisplayListBuilding {
     fn compute_background_image_size(&self,
                                      style: &ServoComputedValues,
                                      bounds: &Rect<Au>,
-                                     image: &WebRenderImageInfo)
+                                     image: &WebRenderImageInfo, index: usize)
                                      -> Size2D<Au>;
 
     /// Adds the display items necessary to paint the background image of this fragment to the
@@ -157,7 +162,8 @@ pub trait FragmentDisplayListBuilding {
                                                display_list_section: DisplayListSection,
                                                absolute_bounds: &Rect<Au>,
                                                clip: &ClippingRegion,
-                                               image_url: &Url);
+                                               image_url: &Url,
+                                               background_index: usize);
 
     /// Adds the display items necessary to paint the background linear gradient of this fragment
     /// to the appropriate section of the display list.
@@ -344,27 +350,32 @@ impl FragmentDisplayListBuilding for Fragment {
         if !border_radii.is_square() {
             clip.intersect_with_rounded_rect(absolute_bounds, &border_radii)
         }
+        let background = style.get_background();
 
         // FIXME: This causes a lot of background colors to be displayed when they are clearly not
         // needed. We could use display list optimization to clean this up, but it still seems
         // inefficient. What we really want is something like "nearest ancestor element that
         // doesn't have a fragment".
-        let background_color = style.resolve_color(style.get_background().background_color);
+        let background_color = style.resolve_color(background.background_color);
 
         // 'background-clip' determines the area within which the background is painted.
         // http://dev.w3.org/csswg/css-backgrounds-3/#the-background-clip
         let mut bounds = *absolute_bounds;
 
-        match style.get_background().background_clip {
-            background_clip::T::border_box => {}
-            background_clip::T::padding_box => {
+        // This is the clip for the color (which is the last element in the bg array)
+        let color_clip = get_cyclic(&background.background_clip.0,
+                                    background.background_image.0.len() - 1);
+
+        match *color_clip {
+            background_clip::single_value::T::border_box => {}
+            background_clip::single_value::T::padding_box => {
                 let border = style.logical_border_width().to_physical(style.writing_mode);
                 bounds.origin.x = bounds.origin.x + border.left;
                 bounds.origin.y = bounds.origin.y + border.top;
                 bounds.size.width = bounds.size.width - border.horizontal();
                 bounds.size.height = bounds.size.height - border.vertical();
             }
-            background_clip::T::content_box => {
+            background_clip::single_value::T::content_box => {
                 let border_padding = self.border_padding.to_physical(style.writing_mode);
                 bounds.origin.x = bounds.origin.x + border_padding.left;
                 bounds.origin.y = bounds.origin.y + border_padding.top;
@@ -388,23 +399,26 @@ impl FragmentDisplayListBuilding for Fragment {
         // Implements background image, per spec:
         // http://www.w3.org/TR/CSS21/colors.html#background
         let background = style.get_background();
-        match background.background_image.0 {
-            None => {}
-            Some(computed::Image::LinearGradient(ref gradient)) => {
-                self.build_display_list_for_background_linear_gradient(state,
-                                                                       display_list_section,
-                                                                       &bounds,
-                                                                       &clip,
-                                                                       gradient,
-                                                                       style);
-            }
-            Some(computed::Image::Url(ref image_url, ref _extra_data)) => {
-                self.build_display_list_for_background_image(state,
-                                                             style,
-                                                             display_list_section,
-                                                             &bounds,
-                                                             &clip,
-                                                             image_url);
+        for (i, background_image) in background.background_image.0.iter().enumerate().rev() {
+            match background_image.0 {
+                None => {}
+                Some(computed::Image::LinearGradient(ref gradient)) => {
+                    self.build_display_list_for_background_linear_gradient(state,
+                                                                           display_list_section,
+                                                                           &bounds,
+                                                                           &clip,
+                                                                           gradient,
+                                                                           style);
+                }
+                Some(computed::Image::Url(ref image_url, ref _extra_data)) => {
+                    self.build_display_list_for_background_image(state,
+                                                                 style,
+                                                                 display_list_section,
+                                                                 &bounds,
+                                                                 &clip,
+                                                                 image_url,
+                                                                 i);
+                }
             }
         }
     }
@@ -412,7 +426,8 @@ impl FragmentDisplayListBuilding for Fragment {
     fn compute_background_image_size(&self,
                                      style: &ServoComputedValues,
                                      bounds: &Rect<Au>,
-                                     image: &WebRenderImageInfo)
+                                     image: &WebRenderImageInfo,
+                                     index: usize)
                                      -> Size2D<Au> {
         // If `image_aspect_ratio` < `bounds_aspect_ratio`, the image is tall; otherwise, it is
         // wide.
@@ -420,19 +435,22 @@ impl FragmentDisplayListBuilding for Fragment {
         let bounds_aspect_ratio = bounds.size.width.to_f64_px() / bounds.size.height.to_f64_px();
         let intrinsic_size = Size2D::new(Au::from_px(image.width as i32),
                                          Au::from_px(image.height as i32));
-        match (style.get_background().background_size.clone(),
-               image_aspect_ratio < bounds_aspect_ratio) {
-            (background_size::T::Contain, false) | (background_size::T::Cover, true) => {
+        let background_size = get_cyclic(&style.get_background().background_size.0, index).clone();
+        match (background_size, image_aspect_ratio < bounds_aspect_ratio) {
+            (background_size::single_value::T::Contain, false) |
+            (background_size::single_value::T::Cover, true) => {
                 Size2D::new(bounds.size.width,
                             Au::from_f64_px(bounds.size.width.to_f64_px() / image_aspect_ratio))
             }
 
-            (background_size::T::Contain, true) | (background_size::T::Cover, false) => {
+            (background_size::single_value::T::Contain, true) |
+            (background_size::single_value::T::Cover, false) => {
                 Size2D::new(Au::from_f64_px(bounds.size.height.to_f64_px() * image_aspect_ratio),
                             bounds.size.height)
             }
 
-            (background_size::T::Explicit(background_size::ExplicitSize {
+            (background_size::single_value::T::Explicit(background_size::single_value
+                                                                       ::ExplicitSize {
                 width,
                 height: LengthOrPercentageOrAuto::Auto,
             }), _) => {
@@ -441,7 +459,8 @@ impl FragmentDisplayListBuilding for Fragment {
                 Size2D::new(width, Au::from_f64_px(width.to_f64_px() / image_aspect_ratio))
             }
 
-            (background_size::T::Explicit(background_size::ExplicitSize {
+            (background_size::single_value::T::Explicit(background_size::single_value
+                                                                       ::ExplicitSize {
                 width: LengthOrPercentageOrAuto::Auto,
                 height
             }), _) => {
@@ -450,7 +469,8 @@ impl FragmentDisplayListBuilding for Fragment {
                 Size2D::new(Au::from_f64_px(height.to_f64_px() * image_aspect_ratio), height)
             }
 
-            (background_size::T::Explicit(background_size::ExplicitSize {
+            (background_size::single_value::T::Explicit(background_size::single_value
+                                                                       ::ExplicitSize {
                 width,
                 height
             }), _) => {
@@ -468,19 +488,22 @@ impl FragmentDisplayListBuilding for Fragment {
                                                display_list_section: DisplayListSection,
                                                absolute_bounds: &Rect<Au>,
                                                clip: &ClippingRegion,
-                                               image_url: &Url) {
+                                               image_url: &Url,
+                                               index: usize) {
         let background = style.get_background();
         let fetch_image_data_as_well = !opts::get().use_webrender;
-        let webrender_image =
-            state.layout_context.get_webrender_image_for_url(image_url,
-                                                             UsePlaceholder::No,
-                                                             fetch_image_data_as_well);
+        let webrender_image = state.shared_layout_context
+                                   .get_webrender_image_for_url(image_url,
+                                                                UsePlaceholder::No,
+                                                                fetch_image_data_as_well);
+
         if let Some((webrender_image, image_data)) = webrender_image {
             debug!("(building display list) building background image");
 
             // Use `background-size` to get the size.
             let mut bounds = *absolute_bounds;
-            let image_size = self.compute_background_image_size(style, &bounds, &webrender_image);
+            let image_size = self.compute_background_image_size(style, &bounds,
+                                                                &webrender_image, index);
 
             // Clip.
             //
@@ -492,25 +515,27 @@ impl FragmentDisplayListBuilding for Fragment {
             let border = style.logical_border_width().to_physical(style.writing_mode);
 
             // Use 'background-origin' to get the origin value.
-            let (mut origin_x, mut origin_y) = match background.background_origin {
-                background_origin::T::padding_box => {
+            let origin = get_cyclic(&background.background_origin.0, index);
+            let (mut origin_x, mut origin_y) = match *origin {
+                background_origin::single_value::T::padding_box => {
                     (Au(0), Au(0))
                 }
-                background_origin::T::border_box => {
+                background_origin::single_value::T::border_box => {
                     (-border.left, -border.top)
                 }
-                background_origin::T::content_box => {
+                background_origin::single_value::T::content_box => {
                     let border_padding = self.border_padding.to_physical(self.style.writing_mode);
                     (border_padding.left - border.left, border_padding.top - border.top)
                 }
             };
 
             // Use `background-attachment` to get the initial virtual origin
-            let (virtual_origin_x, virtual_origin_y) = match background.background_attachment {
-                background_attachment::T::scroll => {
+            let attachment = get_cyclic(&background.background_attachment.0, index);
+            let (virtual_origin_x, virtual_origin_y) = match *attachment {
+                background_attachment::single_value::T::scroll => {
                     (absolute_bounds.origin.x, absolute_bounds.origin.y)
                 }
-                background_attachment::T::fixed => {
+                background_attachment::single_value::T::fixed => {
                     // If the ‘background-attachment’ value for this image is ‘fixed’, then
                     // 'background-origin' has no effect.
                     origin_x = Au(0);
@@ -519,64 +544,95 @@ impl FragmentDisplayListBuilding for Fragment {
                 }
             };
 
+            let position = *get_cyclic(&background.background_position.0, index);
             // Use `background-position` to get the offset.
-            let horizontal_position = model::specified(background.background_position.0.horizontal,
+            let horizontal_position = model::specified(position.horizontal,
                                                        bounds.size.width - image_size.width);
-            let vertical_position = model::specified(background.background_position.0.vertical,
+            let vertical_position = model::specified(position.vertical,
                                                      bounds.size.height - image_size.height);
 
-            let abs_x = border.left + virtual_origin_x + horizontal_position + origin_x;
-            let abs_y = border.top + virtual_origin_y + vertical_position + origin_y;
+            // The anchor position for this background, based on both the background-attachment
+            // and background-position properties.
+            let anchor_origin_x = border.left + virtual_origin_x + origin_x + horizontal_position;
+            let anchor_origin_y = border.top + virtual_origin_y + origin_y + vertical_position;
+
+            let mut tile_spacing = Size2D::zero();
+            let mut stretch_size = image_size;
 
             // Adjust origin and size based on background-repeat
-            match background.background_repeat {
-                background_repeat::T::no_repeat => {
-                    bounds.origin.x = abs_x;
-                    bounds.origin.y = abs_y;
+            match *get_cyclic(&background.background_repeat.0, index) {
+                background_repeat::single_value::T::no_repeat => {
+                    bounds.origin.x = anchor_origin_x;
+                    bounds.origin.y = anchor_origin_y;
                     bounds.size.width = image_size.width;
                     bounds.size.height = image_size.height;
                 }
-                background_repeat::T::repeat_x => {
-                    bounds.origin.y = abs_y;
+                background_repeat::single_value::T::repeat_x => {
+                    bounds.origin.y = anchor_origin_y;
                     bounds.size.height = image_size.height;
                     ImageFragmentInfo::tile_image(&mut bounds.origin.x,
                                                   &mut bounds.size.width,
-                                                  abs_x,
-                                                  image_size.width.to_nearest_px() as u32);
+                                                  anchor_origin_x,
+                                                  image_size.width);
                 }
-                background_repeat::T::repeat_y => {
-                    bounds.origin.x = abs_x;
+                background_repeat::single_value::T::repeat_y => {
+                    bounds.origin.x = anchor_origin_x;
                     bounds.size.width = image_size.width;
                     ImageFragmentInfo::tile_image(&mut bounds.origin.y,
                                                   &mut bounds.size.height,
-                                                  abs_y,
-                                                  image_size.height.to_nearest_px() as u32);
+                                                  anchor_origin_y,
+                                                  image_size.height);
                 }
-                background_repeat::T::repeat => {
+                background_repeat::single_value::T::repeat => {
                     ImageFragmentInfo::tile_image(&mut bounds.origin.x,
                                                   &mut bounds.size.width,
-                                                  abs_x,
-                                                  image_size.width.to_nearest_px() as u32);
+                                                  anchor_origin_x,
+                                                  image_size.width);
                     ImageFragmentInfo::tile_image(&mut bounds.origin.y,
                                                   &mut bounds.size.height,
-                                                  abs_y,
-                                                  image_size.height.to_nearest_px() as u32);
+                                                  anchor_origin_y,
+                                                  image_size.height);
+                }
+                background_repeat::single_value::T::space => {
+                    ImageFragmentInfo::tile_image_spaced(&mut bounds.origin.x,
+                                                         &mut bounds.size.width,
+                                                         &mut tile_spacing.width,
+                                                         anchor_origin_x,
+                                                         image_size.width);
+                    ImageFragmentInfo::tile_image_spaced(&mut bounds.origin.y,
+                                                         &mut bounds.size.height,
+                                                         &mut tile_spacing.height,
+                                                         anchor_origin_y,
+                                                         image_size.height);
+
+                }
+                background_repeat::single_value::T::round => {
+                    ImageFragmentInfo::tile_image_round(&mut bounds.origin.x,
+                                                        &mut bounds.size.width,
+                                                        anchor_origin_x,
+                                                        &mut stretch_size.width);
+                    ImageFragmentInfo::tile_image_round(&mut bounds.origin.y,
+                                                        &mut bounds.size.height,
+                                                        anchor_origin_y,
+                                                        &mut stretch_size.height);
                 }
             };
 
             // Create the image display item.
             let base = state.create_base_display_item(&bounds,
-                                                      &clip,
-                                                      self.node,
-                                                      style.get_cursor(Cursor::Default),
-                                                      display_list_section);
+                                                    &clip,
+                                                    self.node,
+                                                    style.get_cursor(Cursor::Default),
+                                                    display_list_section);
             state.add_display_item(DisplayItem::ImageClass(box ImageDisplayItem {
-                base: base,
-                webrender_image: webrender_image,
-                image_data: image_data.map(Arc::new),
-                stretch_size: Size2D::new(image_size.width, image_size.height),
-                image_rendering: style.get_inheritedbox().image_rendering.clone(),
+              base: base,
+              webrender_image: webrender_image,
+              image_data: image_data.map(Arc::new),
+              stretch_size: stretch_size,
+              tile_spacing: tile_spacing,
+              image_rendering: style.get_inheritedbox().image_rendering.clone(),
             }));
+
         }
     }
 
@@ -1230,6 +1286,7 @@ impl FragmentDisplayListBuilding for Fragment {
                         webrender_image: WebRenderImageInfo::from_image(image),
                         image_data: Some(Arc::new(image.bytes.clone())),
                         stretch_size: stacking_relative_content_box.size,
+                        tile_spacing: Size2D::zero(),
                         image_rendering: self.style.get_inheritedbox().image_rendering.clone(),
                     }));
                 }
@@ -1273,6 +1330,7 @@ impl FragmentDisplayListBuilding for Fragment {
                                     key: canvas_data.image_key,
                                 },
                                 stretch_size: stacking_relative_content_box.size,
+                                tile_spacing: Size2D::zero(),
                                 image_rendering: image_rendering::T::Auto,
                             })
                         }
@@ -1314,7 +1372,7 @@ impl FragmentDisplayListBuilding for Fragment {
                                -> Box<StackingContext> {
         let use_webrender = opts::get().use_webrender;
         let border_box = match mode {
-            StackingContextCreationMode::InnerScrollWrapper if !use_webrender => {
+            StackingContextCreationMode::InnerScrollWrapper => {
                 Rect::new(Point2D::zero(), base_flow.overflow.scroll.size)
             }
             _ => {
@@ -1367,7 +1425,7 @@ impl FragmentDisplayListBuilding for Fragment {
                 let matrix = match *operation {
                     transform::ComputedOperation::Rotate(ax, ay, az, theta) => {
                         let theta = 2.0f32 * f32::consts::PI - theta.radians();
-                        Matrix4D::create_rotation(ax, ay, az, theta)
+                        Matrix4D::create_rotation(ax, ay, az, Radians::new(theta))
                     }
                     transform::ComputedOperation::Perspective(d) => {
                         create_perspective_matrix(d)
@@ -1385,14 +1443,15 @@ impl FragmentDisplayListBuilding for Fragment {
                         m.to_gfx_matrix()
                     }
                     transform::ComputedOperation::Skew(theta_x, theta_y) => {
-                        Matrix4D::create_skew(theta_x.radians(), theta_y.radians())
+                        Matrix4D::create_skew(Radians::new(theta_x.radians()),
+                                              Radians::new(theta_y.radians()))
                     }
                 };
 
-                transform = transform.mul(&matrix);
+                transform = transform.pre_mul(&matrix);
             }
 
-            transform = pre_transform.mul(&transform).mul(&post_transform);
+            transform = pre_transform.pre_mul(&transform).pre_mul(&post_transform);
         }
 
         let perspective = match self.style().get_effects().perspective {
@@ -1413,7 +1472,7 @@ impl FragmentDisplayListBuilding for Fragment {
 
                 let perspective_matrix = create_perspective_matrix(d);
 
-                pre_transform.mul(&perspective_matrix).mul(&post_transform)
+                pre_transform.pre_mul(&perspective_matrix).pre_mul(&post_transform)
             }
             LengthOrNone::None => {
                 Matrix4D::identity()

@@ -35,8 +35,12 @@ pub mod prefs;
 #[cfg(feature = "servo")] pub mod remutex;
 pub mod resource_files;
 pub mod thread;
-pub mod thread_state;
 
-pub fn servo_version() -> &'static str {
-    concat!("Servo ", env!("CARGO_PKG_VERSION"), env!("GIT_INFO"))
+pub fn servo_version() -> String {
+    let cargo_version = env!("CARGO_PKG_VERSION");
+    let git_info = option_env!("GIT_INFO");
+    match git_info {
+        Some(info) => format!("Servo {}{}", cargo_version, info),
+        None => format!("Servo {}", cargo_version),
+    }
 }

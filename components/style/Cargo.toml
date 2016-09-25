@@ -18,14 +18,15 @@ servo = ["serde", "serde/unstable", "serde_macros", "heapsize", "heapsize_plugin
          "cssparser/heap_size", "cssparser/serde-serialization",
          "selectors/heap_size", "selectors/unstable", "string_cache",
          "url/heap_size", "plugins"]
+testing = []
 
 [dependencies]
 app_units = "0.3"
 bitflags = "0.7"
-cssparser = "0.5.7"
+cssparser = "0.7"
 deque = "0.3.1"
 encoding = "0.2"
-euclid = "0.9"
+euclid = "0.10.1"
 fnv = "1.0"
 gecko_bindings = {path = "../../ports/geckolib/gecko_bindings", optional = true}
 gecko_string_cache = {path = "../../ports/geckolib/string_cache", optional = true}
@@ -34,15 +35,17 @@ heapsize_plugin = {version = "0.1.2", optional = true}
 lazy_static = "0.2"
 log = "0.3.5"
 matches = "0.1"
+num-integer = "0.1.32"
 num-traits = "0.1.32"
 ordered-float = "0.2.2"
+quickersort = "2.0.0"
 rand = "0.3"
 rustc-serialize = "0.3"
-selectors = "0.10.1"
+selectors = "0.13"
 serde = {version = "0.8", optional = true}
 serde_macros = {version = "0.8", optional = true}
 smallvec = "0.1"
-string_cache = {version = "0.2.24", features = ["heap_size"], optional = true}
+string_cache = {version = "0.2.26", features = ["heap_size"], optional = true}
 style_traits = {path = "../style_traits"}
 time = "0.1"
 url = "1.2"

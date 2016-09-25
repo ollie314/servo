@@ -12,7 +12,7 @@ use dom::bindings::codegen::Bindings::HTMLOptionElementBinding::HTMLOptionElemen
 use dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
 use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use dom::bindings::conversions::{FromJSValConvertible, StringificationBehavior};
+use dom::bindings::conversions::{ConversionResult, FromJSValConvertible, StringificationBehavior};
 use dom::bindings::inheritance::Castable;
 use dom::bindings::js::Root;
 use dom::bindings::str::DOMString;
@@ -29,14 +29,14 @@ use euclid::rect::Rect;
 use euclid::size::Size2D;
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::{JSContext, HandleValue};
+use js::jsapi::{HandleValue, JSContext};
 use js::jsval::UndefinedValue;
 use msg::constellation_msg::PipelineId;
 use net_traits::CookieSource::{HTTP, NonHTTP};
 use net_traits::CoreResourceMsg::{GetCookiesDataForUrl, SetCookiesForUrlWithData};
 use net_traits::IpcSend;
-use script_traits::webdriver_msg::WebDriverCookieError;
 use script_traits::webdriver_msg::{WebDriverFrameId, WebDriverJSError, WebDriverJSResult, WebDriverJSValue};
+use script_traits::webdriver_msg::WebDriverCookieError;
 use url::Url;
 
 fn find_node_by_unique_id(context: &BrowsingContext,
@@ -59,10 +59,17 @@ pub unsafe fn jsval_to_webdriver(cx: *mut JSContext, val: HandleValue) -> WebDri
     } else if val.get().is_boolean() {
         Ok(WebDriverJSValue::Boolean(val.get().to_boolean()))
     } else if val.get().is_double() || val.get().is_int32() {
-        Ok(WebDriverJSValue::Number(FromJSValConvertible::from_jsval(cx, val, ()).unwrap()))
+        Ok(WebDriverJSValue::Number(match FromJSValConvertible::from_jsval(cx, val, ()).unwrap() {
+               ConversionResult::Success(c) => c,
+               _ => unreachable!(),
+           }))
     } else if val.get().is_string() {
         //FIXME: use jsstring_to_str when jsval grows to_jsstring
-        let string: DOMString = FromJSValConvertible::from_jsval(cx, val, StringificationBehavior::Default).unwrap();
+        let string: DOMString = match FromJSValConvertible::from_jsval(cx, val, StringificationBehavior::Default)
+                                                                      .unwrap() {
+                                    ConversionResult::Success(c) => c,
+                                    _ => unreachable!(),
+                                };
         Ok(WebDriverJSValue::String(String::from(string)))
     } else if val.get().is_null() {
         Ok(WebDriverJSValue::Null)
@@ -133,7 +140,7 @@ pub fn handle_get_frame_id(context: &BrowsingContext,
         }
     };
 
-    let frame_id = window.map(|x| x.map(|x| x.pipeline()));
+    let frame_id = window.map(|x| x.map(|x| x.pipeline_id()));
     reply.send(frame_id).unwrap()
 }
 

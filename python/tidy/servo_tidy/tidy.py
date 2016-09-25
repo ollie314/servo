@@ -19,6 +19,24 @@ import subprocess
 import sys
 from licenseck import MPL, APACHE, COPYRIGHT, licenses_toml, licenses_dep_toml
 import colorama
+import toml
+
+CONFIG_FILE_PATH = os.path.join(".", "servo-tidy.toml")
+
+# Default configs
+config = {
+    "skip-check-length": False,
+    "skip-check-licenses": False,
+    "ignore": {
+        "files": [
+            "./.",   # ignore hidden files
+        ],
+        "directories": [
+            "./.",   # ignore hidden directories
+        ],
+        "packages": [],
+    }
+}
 
 COMMENTS = ["// ", "# ", " *", "/* "]
 
@@ -29,53 +47,6 @@ FILE_PATTERNS_TO_CHECK = ["*.rs", "*.rc", "*.cpp", "*.c",
 
 # File patterns that are ignored for all tidy and lint checks.
 FILE_PATTERNS_TO_IGNORE = ["*.#*", "*.pyc"]
-
-# Files that are ignored for all tidy and lint checks.
-IGNORED_FILES = [
-    # Generated and upstream code combined with our own. Could use cleanup
-    os.path.join(".", "ports", "geckolib", "gecko_bindings", "bindings.rs"),
-    os.path.join(".", "ports", "geckolib", "gecko_bindings", "structs_debug.rs"),
-    os.path.join(".", "ports", "geckolib", "gecko_bindings", "structs_release.rs"),
-    os.path.join(".", "ports", "geckolib", "string_cache", "atom_macro.rs"),
-    os.path.join(".", "resources", "hsts_preload.json"),
-    os.path.join(".", "tests", "wpt", "metadata", "MANIFEST.json"),
-    os.path.join(".", "tests", "wpt", "metadata-css", "MANIFEST.json"),
-    os.path.join(".", "components", "script", "dom", "webidls", "ForceTouchEvent.webidl"),
-    os.path.join(".", "support", "android", "openssl.sh"),
-    # Ignore those files since the issues reported are on purpose
-    os.path.join(".", "tests", "html", "bad-line-ends.html"),
-    os.path.join(".", "tests", "unit", "net", "parsable_mime", "text"),
-    os.path.join(".", "tests", "wpt", "mozilla", "tests", "css", "fonts"),
-    os.path.join(".", "tests", "wpt", "mozilla", "tests", "css", "pre_with_tab.html"),
-    # FIXME(pcwalton, #11679): This is a workaround for a tidy error on the quoted string
-    # `"__TEXT,_info_plist"` inside an attribute.
-    os.path.join(".", "components", "servo", "platform", "macos", "mod.rs"),
-    # Hidden files
-    os.path.join(".", "."),
-]
-
-# Directories that are ignored for the non-WPT tidy check.
-IGNORED_DIRS = [
-    # Upstream
-    os.path.join(".", "support", "android", "apk"),
-    os.path.join(".", "tests", "wpt", "css-tests"),
-    os.path.join(".", "tests", "wpt", "harness"),
-    os.path.join(".", "tests", "wpt", "update"),
-    os.path.join(".", "tests", "wpt", "web-platform-tests"),
-    os.path.join(".", "tests", "wpt", "mozilla", "tests", "mozilla", "referrer-policy"),
-    os.path.join(".", "tests", "wpt", "sync"),
-    os.path.join(".", "tests", "wpt", "sync_css"),
-    os.path.join(".", "python", "mach"),
-    os.path.join(".", "python", "tidy", "servo_tidy_tests"),
-    os.path.join(".", "components", "script", "dom", "bindings", "codegen", "parser"),
-    os.path.join(".", "components", "script", "dom", "bindings", "codegen", "ply"),
-    os.path.join(".", "python", "_virtualenv"),
-    # Generated and upstream code combined with our own. Could use cleanup
-    os.path.join(".", "target"),
-    os.path.join(".", "ports", "cef"),
-    # Hidden directories
-    os.path.join(".", "."),
-]
 
 SPEC_BASE_PATH = "components/script/dom/"
 
@@ -125,7 +96,7 @@ def progress_wrapper(iterator):
 
 
 def filter_file(file_name):
-    if any(file_name.startswith(ignored_file) for ignored_file in IGNORED_FILES):
+    if any(file_name.startswith(ignored_file) for ignored_file in config["ignore"]["files"]):
         return False
     base_name = os.path.basename(file_name)
     if any(fnmatch.fnmatch(base_name, pattern) for pattern in FILE_PATTERNS_TO_IGNORE):
@@ -134,12 +105,13 @@ def filter_file(file_name):
 
 
 def filter_files(start_dir, only_changed_files, progress):
-    file_iter = get_file_list(start_dir, only_changed_files, IGNORED_DIRS)
+    file_iter = get_file_list(start_dir, only_changed_files, config["ignore"]["directories"])
     (has_element, file_iter) = is_iter_empty(file_iter)
     if not has_element:
         raise StopIteration
     if progress:
         file_iter = progress_wrapper(file_iter)
+
     for file_name in file_iter:
         base_name = os.path.basename(file_name)
         if not any(fnmatch.fnmatch(base_name, pattern) for pattern in FILE_PATTERNS_TO_CHECK):
@@ -157,17 +129,14 @@ def uncomment(line):
             return line[len(c):].strip()
 
 
-def licensed_mpl(header):
-    return MPL in header
-
-
-def licensed_apache(header):
+def is_apache_licensed(header):
     if APACHE in header:
         return any(c in header for c in COPYRIGHT)
 
 
 def check_license(file_name, lines):
-    if any(file_name.endswith(ext) for ext in (".toml", ".lock", ".json", ".html")):
+    if any(file_name.endswith(ext) for ext in (".toml", ".lock", ".json", ".html")) or \
+       config["skip-check-licenses"]:
         raise StopIteration
 
     if lines[0].startswith("#!") and lines[1].strip():
@@ -186,9 +155,10 @@ def check_license(file_name, lines):
         line = uncomment(l)
         if line is not None:
             license_block.append(line)
-    contents = " ".join(license_block)
-    valid_license = licensed_mpl(contents) or licensed_apache(contents)
-    acknowledged_bad_license = "xfail-license" in contents
+
+    header = " ".join(license_block)
+    valid_license = MPL in header or is_apache_licensed(header)
+    acknowledged_bad_license = "xfail-license" in header
     if not (valid_license or acknowledged_bad_license):
         yield (1, "incorrect license")
 
@@ -202,14 +172,12 @@ def check_modeline(file_name, lines):
 
 
 def check_length(file_name, idx, line):
-    for suffix in [".lock", ".json", ".html", ".toml"]:
-        if file_name.endswith(suffix):
-            raise StopIteration
+    if any(file_name.endswith(ext) for ext in (".lock", ".json", ".html", ".toml")) or \
+       config["skip-check-length"]:
+        raise StopIteration
+
     # Prefer shorter lines when shell scripting.
-    if file_name.endswith(".sh"):
-        max_length = 80
-    else:
-        max_length = 120
+    max_length = 80 if file_name.endswith(".sh") else 120
     if len(line.rstrip('\n')) > max_length:
         yield (idx + 1, "Line is longer than %d characters" % max_length)
 
@@ -296,14 +264,13 @@ def check_lock(file_name, contents):
         raise StopIteration
 
     # package names to be neglected (as named by cargo)
-    exceptions = ["lazy_static"]
+    exceptions = config["ignore"]["packages"]
 
     # toml.py has a bug(?) that we trip up in [metadata] sections;
     # see https://github.com/uiri/toml/issues/61
     # This should only affect a very few lines (that have embedded ?branch=...),
     # and most of them won't be in the repo
     try:
-        import toml
         content = toml.loads(contents)
     except:
         print "WARNING!"
@@ -344,7 +311,7 @@ duplicate versions for package "{package}"
 
 
 def check_toml(file_name, lines):
-    if not file_name.endswith(".toml"):
+    if not file_name.endswith("Cargo.toml"):
         raise StopIteration
     ok_licensed = False
     for idx, line in enumerate(lines):
@@ -365,7 +332,7 @@ def check_shell(file_name, lines):
 
     did_shebang_check = False
 
-    if len(lines) == 0:
+    if not lines:
         yield (0, 'script is an empty file')
         return
 
@@ -384,7 +351,7 @@ def check_shell(file_name, lines):
             else:
                 # The first non-comment, non-whitespace, non-option line is the first "real" line of the script.
                 # The shebang, options, etc. must come before this.
-                if len(required_options) != 0:
+                if required_options:
                     formatted = ['"{}"'.format(opt) for opt in required_options]
                     yield (idx + 1, "script is missing options {}".format(", ".join(formatted)))
                 did_shebang_check = True
@@ -447,9 +414,8 @@ def check_rust(file_name, lines):
             line = merged_lines + line
             merged_lines = ''
 
-        # Keep track of whitespace to enable checking for a merged import block
-
         # Ignore attributes, comments, and imports
+        # Keep track of whitespace to enable checking for a merged import block
         if import_block:
             if not (is_comment or is_attribute or line.startswith("use ")):
                 whitespace = line == ""
@@ -517,6 +483,7 @@ def check_rust(file_name, lines):
             (r"\{[A-Za-z0-9_]+\};", "use statement contains braces for single import",
                 lambda match, line: line.startswith('use ')),
             (r"^\s*else {", "else braces should be on the same line", no_filter),
+            (r"[^$ ]\([ \t]", "extra space after (", no_filter),
         ]
 
         for pattern, message, filter_func in regex_rules:
@@ -550,10 +517,13 @@ def check_rust(file_name, lines):
                 yield (idx + 1, "use statement spans multiple lines")
             # strip "use" from the begin and ";" from the end
             current_use = line[4:-1]
-            if indent == current_indent and prev_use and current_use < prev_use:
-                yield(idx + 1, decl_message.format("use statement")
-                      + decl_expected.format(prev_use)
-                      + decl_found.format(current_use))
+            if prev_use:
+                current_use_cut = current_use.replace("{self,", ".").replace("{", ".")
+                prev_use_cut = prev_use.replace("{self,", ".").replace("{", ".")
+                if indent == current_indent and current_use_cut < prev_use_cut:
+                    yield(idx + 1, decl_message.format("use statement")
+                          + decl_expected.format(prev_use)
+                          + decl_found.format(current_use))
             prev_use = current_use
             current_indent = indent
 
@@ -577,7 +547,7 @@ def check_rust(file_name, lines):
                     prev_mod[indent] = ""
                 if match == -1 and not line.endswith(";"):
                     yield (idx + 1, "mod declaration spans multiple lines")
-                if len(prev_mod[indent]) > 0 and mod < prev_mod[indent]:
+                if prev_mod[indent] and mod < prev_mod[indent]:
                     yield(idx + 1, decl_message.format("mod declaration")
                           + decl_expected.format(prev_mod[indent])
                           + decl_found.format(mod))
@@ -694,6 +664,73 @@ def check_spec(file_name, lines):
                 brace_count -= 1
 
 
+def check_config_file(config_file, print_text=True):
+    # Check if config file exists
+    if not os.path.exists(config_file):
+        print("%s config file is required but was not found" % config_file)
+        sys.exit(1)
+
+    # Load configs from servo-tidy.toml
+    with open(config_file) as content:
+        conf_file = content.read()
+        lines = conf_file.splitlines(True)
+
+    if print_text:
+        print '\rChecking the config file...'
+
+    current_table = ""
+    for idx, line in enumerate(lines):
+        # Ignore comment lines
+        if line.strip().startswith("#"):
+            continue
+
+        # Check for invalid tables
+        if re.match("\[(.*?)\]", line.strip()):
+            table_name = re.findall(r"\[(.*?)\]", line)[0].strip()
+            if table_name not in ("configs", "ignore"):
+                yield config_file, idx + 1, "invalid config table [%s]" % table_name
+            current_table = table_name
+            continue
+
+        # Skip if there is no equal sign in line, assuming it's not a key
+        if "=" not in line:
+            continue
+
+        key = line.split("=")[0].strip()
+
+        # Check for invalid keys inside [configs] and [ignore] table
+        if (current_table == "configs" and key not in config or
+                current_table == "ignore" and key not in config["ignore"] or
+                # Any key outside of tables
+                current_table == ""):
+            yield config_file, idx + 1, "invalid config key '%s'" % key
+
+    # Parse config file
+    parse_config(conf_file)
+
+
+def parse_config(content):
+    config_file = toml.loads(content)
+    exclude = config_file.get("ignore", {})
+    # Add list of ignored directories to config
+    config["ignore"]["directories"] += exclude.get("directories", [])
+    # Add list of ignored files to config
+    config["ignore"]["files"] += exclude.get("files", [])
+    # Add list of ignored packages to config
+    config["ignore"]["packages"] = exclude.get("packages", [])
+    # Fix the paths (OS-dependent)
+    config['ignore']['files'] = map(lambda path: os.path.join(*path.split('/')),
+                                    config['ignore']['files'])
+    config['ignore']['directories'] = map(lambda path: os.path.join(*path.split('/')),
+                                          config['ignore']['directories'])
+
+    # Override default configs
+    user_configs = config_file.get("configs", [])
+    for pref in user_configs:
+        if pref in config:
+            config[pref] = user_configs[pref]
+
+
 def collect_errors_for_files(files_to_check, checking_functions, line_checking_functions, print_text=True):
     (has_element, files_to_check) = is_iter_empty(files_to_check)
     if not has_element:
@@ -706,6 +743,9 @@ def collect_errors_for_files(files_to_check, checking_functions, line_checking_f
             continue
         with open(filename, "r") as f:
             contents = f.read()
+            if not contents.strip():
+                yield filename, 0, "file is empty"
+                continue
             for check in checking_functions:
                 for error in check(filename, contents):
                     # the result will be: `(filename, line, message)`
@@ -773,6 +813,7 @@ def get_file_list(directory, only_changed_files=False, exclude_dirs=[]):
         args = ["git", "ls-files", "--others", "--exclude-standard", directory]
         file_list += subprocess.check_output(args)
         for f in file_list.splitlines():
+            f = os.path.join(*f.split("/")) if sys.platform == "win32" else f
             if not any(os.path.join('.', os.path.dirname(f)).startswith(path) for path in exclude_dirs):
                 yield os.path.join('.', f)
     elif exclude_dirs:
@@ -788,24 +829,29 @@ def get_file_list(directory, only_changed_files=False, exclude_dirs=[]):
 
 
 def scan(only_changed_files=False, progress=True):
+    # check config file for errors
+    config_errors = check_config_file(CONFIG_FILE_PATH)
     # standard checks
     files_to_check = filter_files('.', only_changed_files, progress)
     checking_functions = (check_flake8, check_lock, check_webidl_spec, check_json)
     line_checking_functions = (check_license, check_by_line, check_toml, check_shell,
                                check_rust, check_spec, check_modeline)
-    errors = collect_errors_for_files(files_to_check, checking_functions, line_checking_functions)
+    file_errors = collect_errors_for_files(files_to_check, checking_functions, line_checking_functions)
     # check dependecy licenses
     dep_license_errors = check_dep_license_errors(get_dep_toml_files(only_changed_files), progress)
     # wpt lint checks
     wpt_lint_errors = check_wpt_lint_errors(get_wpt_files(only_changed_files, progress))
-    # collect errors
-    errors = itertools.chain(errors, dep_license_errors, wpt_lint_errors)
+    # chain all the iterators
+    errors = itertools.chain(config_errors, file_errors, dep_license_errors, wpt_lint_errors)
+
     error = None
     for error in errors:
         colorama.init()
         print "\r\033[94m{}\033[0m:\033[93m{}\033[0m: \033[91m{}\033[0m".format(*error)
+
     print
     if error is None:
         colorama.init()
         print "\033[92mtidy reported no errors.\033[0m"
+
     return int(error is not None)

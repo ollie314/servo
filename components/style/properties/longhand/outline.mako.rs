@@ -66,6 +66,11 @@ ${helpers.predefined_type("outline-color", "CSSColor", "::cssparser::Color::Curr
         fn to_computed_value(&self, context: &Context) -> computed_value::T {
             self.0.to_computed_value(context)
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue(ToComputedValue::from_computed_value(computed))
+        }
     }
 </%helpers:longhand>
 
@@ -78,4 +83,4 @@ ${helpers.predefined_type("outline-color", "CSSColor", "::cssparser::Color::Curr
                               animatable=False)}
 % endfor
 
-${helpers.predefined_type("outline-offset", "Length", "Au(0)", animatable=True)}
+${helpers.predefined_type("outline-offset", "Length", "Au(0)", products="servo", animatable=True)}

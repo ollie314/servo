@@ -9,13 +9,13 @@
 
 use app_units::Au;
 use block::BlockFlow;
-use context::LayoutContext;
+use context::{LayoutContext, SharedLayoutContext};
 use display_list_builder::{DisplayListBuildState, ListItemFlowDisplayListBuilding};
 use euclid::Point2D;
 use floats::FloatKind;
 use flow::{Flow, FlowClass, OpaqueFlow};
-use fragment::Overflow;
 use fragment::{CoordinateSystem, Fragment, FragmentBorderBoxIterator, GeneratedContentInfo};
+use fragment::Overflow;
 use generated_content;
 use gfx::display_list::StackingContext;
 use gfx_traits::StackingContextId;
@@ -124,7 +124,7 @@ impl Flow for ListItemFlow {
         }
     }
 
-    fn compute_absolute_position(&mut self, layout_context: &LayoutContext) {
+    fn compute_absolute_position(&mut self, layout_context: &SharedLayoutContext) {
         self.block_flow.compute_absolute_position(layout_context)
     }
 

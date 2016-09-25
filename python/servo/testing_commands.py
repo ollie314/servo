@@ -25,7 +25,7 @@ from mach.decorators import (
     Command,
 )
 
-from servo.command_base import CommandBase, call, check_call, host_triple
+from servo.command_base import CommandBase, call, cd, check_call, host_triple
 from wptrunner import wptcommandline
 from update import updatecommandline
 from servo_tidy import tidy
@@ -208,6 +208,8 @@ class MachCommands(CommandBase):
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit")))
 
+        packages.discard('stylo')
+
         args = ["cargo", "test"]
         for crate in packages:
             args += ["-p", "%s_tests" % crate]
@@ -229,6 +231,23 @@ class MachCommands(CommandBase):
                 env["RUSTFLAGS"] = "-C link-args=-Wl,--subsystem,windows"
 
         result = call(args, env=env, cwd=self.servo_crate())
+        if result != 0:
+            return result
+
+    @Command('test-stylo',
+             description='Run stylo unit tests',
+             category='testing')
+    def test_stylo(self):
+        self.set_use_stable_rust()
+        self.ensure_bootstrapped()
+
+        env = self.build_env()
+        env["RUST_BACKTRACE"] = "1"
+        env["CARGO_TARGET_DIR"] = path.join(self.context.topdir, "target", "geckolib").encode("UTF-8")
+
+        with cd(path.join("ports", "geckolib")):
+            result = call(["cargo", "test", "-p", "stylo_tests"], env=env)
+
         if result != 0:
             return result
 
@@ -338,7 +357,7 @@ class MachCommands(CommandBase):
         return run_globals["run_tests"](tests, verbose)
 
     @Command('test-wpt-failure',
-             description='Run the web platform tests',
+             description='Run the tests harness that verifies that the test failures are reported correctly',
              category='testing')
     def test_wpt_failure(self):
         self.ensure_bootstrapped()
@@ -351,7 +370,7 @@ class MachCommands(CommandBase):
         ], env=self.build_env())
 
     @Command('test-wpt',
-             description='Run the web platform tests',
+             description='Run the regular web platform test suite',
              category='testing',
              parser=create_parser_wpt)
     def test_wpt(self, **kwargs):
@@ -403,7 +422,7 @@ class MachCommands(CommandBase):
         return run_globals["run_tests"](**kwargs)
 
     @Command('update-manifest',
-             description='run test-wpt --manifest-update SKIP_TESTS to regenerate MANIFEST.json',
+             description='Run test-wpt --manifest-update SKIP_TESTS to regenerate MANIFEST.json',
              category='testing',
              parser=create_parser_wpt)
     def update_manifest(self, **kwargs):
@@ -463,7 +482,7 @@ class MachCommands(CommandBase):
         return self.jquery_test_runner("update", release, dev)
 
     @Command('test-css',
-             description='Run the web platform tests',
+             description='Run the web platform CSS tests',
              category='testing',
              parser=create_parser_wpt)
     def test_css(self, **kwargs):
@@ -475,7 +494,7 @@ class MachCommands(CommandBase):
         return self.wptrunner(run_file, **kwargs)
 
     @Command('update-css',
-             description='Update the web platform tests',
+             description='Update the web platform CSS tests',
              category='testing',
              parser=updatecommandline.create_parser())
     @CommandArgument('--patch', action='store_true', default=False,
@@ -494,7 +513,7 @@ class MachCommands(CommandBase):
         return run_globals["update_tests"](**kwargs)
 
     @Command('compare_dromaeo',
-             description='compare outputs of two runs of ./mach test-dromaeo command',
+             description='Compare outputs of two runs of ./mach test-dromaeo command',
              category='testing')
     @CommandArgument('params', default=None, nargs="...",
                      help=" filepaths of output files of two runs of dromaeo test ")

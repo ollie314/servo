@@ -5,9 +5,9 @@
 use canvas_traits::{Canvas2dMsg, CanvasCommonMsg, CanvasMsg};
 use canvas_traits::{CompositionOrBlending, FillOrStrokeStyle, FillRule};
 use canvas_traits::{LineCapStyle, LineJoinStyle, LinearGradientStyle};
-use canvas_traits::{RadialGradientStyle, RepetitionStyle, byte_swap};
-use cssparser::Color as CSSColor;
+use canvas_traits::{RadialGradientStyle, RepetitionStyle, byte_swap, byte_swap_and_premultiply};
 use cssparser::{Parser, RGBA};
+use cssparser::Color as CSSColor;
 use dom::bindings::cell::DOMRefCell;
 use dom::bindings::codegen::Bindings::CSSStyleDeclarationBinding::CSSStyleDeclarationMethods;
 use dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding;
@@ -19,7 +19,7 @@ use dom::bindings::codegen::Bindings::ImageDataBinding::ImageDataMethods;
 use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::UnionTypes::HTMLImageElementOrHTMLCanvasElementOrCanvasRenderingContext2D;
 use dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
-use dom::bindings::error::{Error, Fallible, ErrorResult};
+use dom::bindings::error::{Error, ErrorResult, Fallible};
 use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::Castable;
 use dom::bindings::js::{JS, LayoutJS, Root};
@@ -42,11 +42,12 @@ use net_traits::image::base::PixelFormat;
 use net_traits::image_cache_thread::ImageResponse;
 use num_traits::ToPrimitive;
 use script_traits::ScriptMsg as ConstellationMsg;
+use std::{cmp, fmt};
 use std::cell::Cell;
 use std::str::FromStr;
-use std::{cmp, fmt};
 use unpremultiplytable::UNPREMULTIPLY_TABLE;
 use url::Url;
+use util::opts;
 
 #[must_root]
 #[derive(JSTraceable, Clone, HeapSizeOf)]
@@ -299,7 +300,14 @@ impl CanvasRenderingContext2D {
                     Some((mut data, size)) => {
                         // Pixels come from cache in BGRA order and drawImage expects RGBA so we
                         // have to swap the color values
-                        byte_swap(&mut data);
+                        if opts::get().use_webrender {
+                            // Webrender doesn't pre-multiply alpha when decoding
+                            // images, but canvas expects the images to be
+                            // pre-multiplied alpha.
+                            byte_swap_and_premultiply(&mut data);
+                        } else {
+                            byte_swap(&mut data);
+                        }
                         let size = Size2D::new(size.width as f64, size.height as f64);
                         (data, size)
                     },
@@ -573,7 +581,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         }
 
         let transform = self.state.borrow().transform;
-        self.state.borrow_mut().transform = transform.scale(x as f32, y as f32);
+        self.state.borrow_mut().transform = transform.pre_scaled(x as f32, y as f32);
         self.update_transform()
     }
 
@@ -585,9 +593,10 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
 
         let (sin, cos) = (angle.sin(), angle.cos());
         let transform = self.state.borrow().transform;
-        self.state.borrow_mut().transform = transform.mul(&Matrix2D::new(cos as f32, sin as f32,
-                                                                         -sin as f32, cos as f32,
-                                                                         0.0, 0.0));
+        self.state.borrow_mut().transform = transform.pre_mul(
+            &Matrix2D::row_major(cos as f32, sin as f32,
+                                 -sin as f32, cos as f32,
+                                 0.0, 0.0));
         self.update_transform()
     }
 
@@ -598,7 +607,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         }
 
         let transform = self.state.borrow().transform;
-        self.state.borrow_mut().transform = transform.translate(x as f32, y as f32);
+        self.state.borrow_mut().transform = transform.pre_translated(x as f32, y as f32);
         self.update_transform()
     }
 
@@ -610,12 +619,8 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         }
 
         let transform = self.state.borrow().transform;
-        self.state.borrow_mut().transform = transform.mul(&Matrix2D::new(a as f32,
-                                                                         b as f32,
-                                                                         c as f32,
-                                                                         d as f32,
-                                                                         e as f32,
-                                                                         f as f32));
+        self.state.borrow_mut().transform = transform.pre_mul(
+            &Matrix2D::row_major(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32));
         self.update_transform()
     }
 
@@ -626,12 +631,8 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
             return;
         }
 
-        self.state.borrow_mut().transform = Matrix2D::new(a as f32,
-                                                          b as f32,
-                                                          c as f32,
-                                                          d as f32,
-                                                          e as f32,
-                                                          f as f32);
+        self.state.borrow_mut().transform =
+            Matrix2D::row_major(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32);
         self.update_transform()
     }
 
@@ -1095,16 +1096,16 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
                      imagedata: &ImageData,
                      dx: Finite<f64>,
                      dy: Finite<f64>,
-                     dirtyX: Finite<f64>,
-                     dirtyY: Finite<f64>,
-                     dirtyWidth: Finite<f64>,
-                     dirtyHeight: Finite<f64>) {
-        let data = imagedata.get_data_array(&self.global().r());
+                     dirty_x: Finite<f64>,
+                     dirty_y: Finite<f64>,
+                     dirty_width: Finite<f64>,
+                     dirty_height: Finite<f64>) {
+        let data = imagedata.get_data_array();
         let offset = Point2D::new(*dx, *dy);
         let image_data_size = Size2D::new(imagedata.Width() as f64, imagedata.Height() as f64);
 
-        let dirty_rect = Rect::new(Point2D::new(*dirtyX, *dirtyY),
-                                   Size2D::new(*dirtyWidth, *dirtyHeight));
+        let dirty_rect = Rect::new(Point2D::new(*dirty_x, *dirty_y),
+                                   Size2D::new(*dirty_width, *dirty_height));
         let msg = CanvasMsg::Canvas2d(Canvas2dMsg::PutImageData(data,
                                                                 offset,
                                                                 image_data_size,

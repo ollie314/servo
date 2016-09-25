@@ -111,6 +111,18 @@ ${helpers.predefined_type("opacity",
                 inset: self.inset,
             }
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue {
+                offset_x: ToComputedValue::from_computed_value(&computed.offset_x),
+                offset_y: ToComputedValue::from_computed_value(&computed.offset_y),
+                blur_radius: ToComputedValue::from_computed_value(&computed.blur_radius),
+                spread_radius: ToComputedValue::from_computed_value(&computed.spread_radius),
+                color: Some(ToComputedValue::from_computed_value(&computed.color)),
+                inset: computed.inset,
+            }
+        }
     }
 
     pub fn parse(_context: &ParserContext, input: &mut Parser) -> Result<SpecifiedValue, ()> {
@@ -175,7 +187,7 @@ ${helpers.predefined_type("opacity",
 </%helpers:vector_longhand>
 
 // FIXME: This prop should be animatable
-<%helpers:longhand name="clip" animatable="False">
+<%helpers:longhand name="clip" products="servo" animatable="False">
     use cssparser::ToCss;
     use std::fmt;
     use values::LocalToCss;
@@ -185,6 +197,7 @@ ${helpers.predefined_type("opacity",
 
     pub mod computed_value {
         use app_units::Au;
+        use properties::animated_properties::Interpolate;
 
         #[derive(Clone, PartialEq, Eq, Copy, Debug)]
         #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
@@ -198,6 +211,20 @@ ${helpers.predefined_type("opacity",
         #[derive(Debug, Clone, PartialEq)]
         #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
         pub struct T(pub Option<ClipRect>);
+
+
+        /// https://drafts.csswg.org/css-transitions/#animtype-rect
+        impl Interpolate for ClipRect {
+            #[inline]
+            fn interpolate(&self, other: &Self, time: f64) -> Result<Self, ()> {
+                Ok(ClipRect {
+                    top: try!(self.top.interpolate(&other.top, time)),
+                    right: try!(self.right.interpolate(&other.right, time)),
+                    bottom: try!(self.bottom.interpolate(&other.bottom, time)),
+                    left: try!(self.left.interpolate(&other.left, time)),
+                })
+            }
+        }
     }
 
     impl ToCss for computed_value::T {
@@ -314,6 +341,16 @@ ${helpers.predefined_type("opacity",
                 left: value.left.to_computed_value(context),
             }))
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue(computed.0.map(|value| SpecifiedClipRect {
+                top: ToComputedValue::from_computed_value(&value.top),
+                right: value.right.map(|right| ToComputedValue::from_computed_value(&right)),
+                bottom: value.bottom.map(|bottom| ToComputedValue::from_computed_value(&bottom)),
+                left: ToComputedValue::from_computed_value(&value.left),
+            }))
+        }
     }
 
     pub fn parse(_context: &ParserContext, input: &mut Parser) -> Result<SpecifiedValue, ()> {
@@ -364,7 +401,7 @@ ${helpers.predefined_type("opacity",
 </%helpers:longhand>
 
 // FIXME: This prop should be animatable
-<%helpers:longhand name="filter" animatable="False">
+<%helpers:longhand name="filter" products="servo" animatable="False">
     //pub use self::computed_value::T as SpecifiedValue;
     use cssparser::ToCss;
     use std::fmt;
@@ -614,10 +651,27 @@ ${helpers.predefined_type("opacity",
                 }
             }).collect() }
         }
+
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue(computed.filters.iter().map(|value| {
+                match *value {
+                    computed_value::Filter::Blur(factor) =>
+                        SpecifiedFilter::Blur(ToComputedValue::from_computed_value(&factor)),
+                    computed_value::Filter::Brightness(factor) => SpecifiedFilter::Brightness(factor),
+                    computed_value::Filter::Contrast(factor) => SpecifiedFilter::Contrast(factor),
+                    computed_value::Filter::Grayscale(factor) => SpecifiedFilter::Grayscale(factor),
+                    computed_value::Filter::HueRotate(factor) => SpecifiedFilter::HueRotate(factor),
+                    computed_value::Filter::Invert(factor) => SpecifiedFilter::Invert(factor),
+                    computed_value::Filter::Opacity(factor) => SpecifiedFilter::Opacity(factor),
+                    computed_value::Filter::Saturate(factor) => SpecifiedFilter::Saturate(factor),
+                    computed_value::Filter::Sepia(factor) => SpecifiedFilter::Sepia(factor),
+                }
+            }).collect())
+        }
     }
 </%helpers:longhand>
 
-<%helpers:longhand name="transform" animatable="True">
+<%helpers:longhand name="transform" products="servo" animatable="True">
     use app_units::Au;
     use values::CSSFloat;
     use values::HasViewportPercentage;
@@ -1084,7 +1138,8 @@ ${helpers.predefined_type("opacity",
                         result.push(computed_value::ComputedOperation::Scale(sx, sy, sz));
                     }
                     SpecifiedOperation::Rotate(ax, ay, az, theta) => {
-                        result.push(computed_value::ComputedOperation::Rotate(ax, ay, az, theta));
+                        let len = (ax * ax + ay * ay + az * az).sqrt();
+                        result.push(computed_value::ComputedOperation::Rotate(ax / len, ay / len, az / len, theta));
                     }
                     SpecifiedOperation::Skew(theta_x, theta_y) => {
                         result.push(computed_value::ComputedOperation::Skew(theta_x, theta_y));
@@ -1096,6 +1151,43 @@ ${helpers.predefined_type("opacity",
             }
 
             computed_value::T(Some(result))
+        }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue(computed.0.as_ref().map(|computed| {
+                let mut result = vec!();
+                for operation in computed {
+                    match *operation {
+                        computed_value::ComputedOperation::Matrix(ref matrix) => {
+                            result.push(SpecifiedOperation::Matrix(*matrix));
+                        }
+                        computed_value::ComputedOperation::Translate(ref tx, ref ty, ref tz) => {
+                            // XXXManishearth we lose information here; perhaps we should try to
+                            // recover the original function? Not sure if this can be observed.
+                            result.push(SpecifiedOperation::Translate(TranslateKind::Translate,
+                                              ToComputedValue::from_computed_value(tx),
+                                              ToComputedValue::from_computed_value(ty),
+                                              ToComputedValue::from_computed_value(tz)));
+                        }
+                        computed_value::ComputedOperation::Scale(sx, sy, sz) => {
+                            result.push(SpecifiedOperation::Scale(sx, sy, sz));
+                        }
+                        computed_value::ComputedOperation::Rotate(ax, ay, az, theta) => {
+                            result.push(SpecifiedOperation::Rotate(ax, ay, az, theta));
+                        }
+                        computed_value::ComputedOperation::Skew(theta_x, theta_y) => {
+                            result.push(SpecifiedOperation::Skew(theta_x, theta_y));
+                        }
+                        computed_value::ComputedOperation::Perspective(ref d) => {
+                            result.push(SpecifiedOperation::Perspective(
+                                ToComputedValue::from_computed_value(d)
+                            ));
+                        }
+                    };
+                }
+                result
+            }).unwrap_or(Vec::new()))
         }
     }
 </%helpers:longhand>
@@ -1196,7 +1288,7 @@ ${helpers.single_keyword("transform-style",
                          "auto flat preserve-3d",
                          animatable=False)}
 
-<%helpers:longhand name="transform-origin" animatable="True">
+<%helpers:longhand name="transform-origin" products="servo" animatable="True">
     use app_units::Au;
     use values::LocalToCss;
     use values::HasViewportPercentage;
@@ -1206,6 +1298,7 @@ ${helpers.single_keyword("transform-style",
     use std::fmt;
 
     pub mod computed_value {
+        use properties::animated_properties::Interpolate;
         use values::computed::{Length, LengthOrPercentage};
 
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1214,6 +1307,16 @@ ${helpers.single_keyword("transform-style",
             pub horizontal: LengthOrPercentage,
             pub vertical: LengthOrPercentage,
             pub depth: Length,
+        }
+
+        impl Interpolate for T {
+            fn interpolate(&self, other: &Self, time: f64) -> Result<Self, ()> {
+                Ok(T {
+                    horizontal: try!(self.horizontal.interpolate(&other.horizontal, time)),
+                    vertical: try!(self.vertical.interpolate(&other.vertical, time)),
+                    depth: try!(self.depth.interpolate(&other.depth, time)),
+                })
+            }
         }
     }
 
@@ -1282,16 +1385,26 @@ ${helpers.single_keyword("transform-style",
                 depth: self.depth.to_computed_value(context),
             }
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue {
+                horizontal: ToComputedValue::from_computed_value(&computed.horizontal),
+                vertical: ToComputedValue::from_computed_value(&computed.vertical),
+                depth: ToComputedValue::from_computed_value(&computed.depth),
+            }
+        }
     }
 </%helpers:longhand>
 
 ${helpers.predefined_type("perspective",
                           "LengthOrNone",
                           "computed::LengthOrNone::None",
+                          products="servo",
                           animatable=True)}
 
 // FIXME: This prop should be animatable
-<%helpers:longhand name="perspective-origin" animatable="False">
+<%helpers:longhand name="perspective-origin" products="servo" animatable="False">
     use values::HasViewportPercentage;
     use values::specified::{LengthOrPercentage, Percentage};
 
@@ -1365,6 +1478,14 @@ ${helpers.predefined_type("perspective",
             computed_value::T {
                 horizontal: self.horizontal.to_computed_value(context),
                 vertical: self.vertical.to_computed_value(context),
+            }
+        }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            SpecifiedValue {
+                horizontal: ToComputedValue::from_computed_value(&computed.horizontal),
+                vertical: ToComputedValue::from_computed_value(&computed.vertical),
             }
         }
     }

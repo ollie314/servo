@@ -39,10 +39,12 @@ use dom::bindings::reflector::{Reflectable, Reflector};
 use dom::bindings::str::{ByteString, DOMString, USVString};
 use dom::bindings::utils::DOMClass;
 use js;
-pub use js::conversions::{FromJSValConvertible, ToJSValConvertible, ConversionBehavior};
+pub use js::conversions::{FromJSValConvertible, ToJSValConvertible, ConversionResult};
+pub use js::conversions::ConversionBehavior;
 use js::conversions::latin1_to_string;
 use js::error::throw_type_error;
 use js::glue::{GetProxyPrivate, IsWrapper};
+use js::glue::{RUST_JSID_IS_INT, RUST_JSID_TO_INT};
 use js::glue::{RUST_JSID_IS_STRING, RUST_JSID_TO_STRING, UnwrapObject};
 use js::jsapi::{HandleId, HandleObject, HandleValue, JSClass, JSContext};
 use js::jsapi::{JSObject, JSString, JS_GetArrayBufferViewType, JS_GetClass};
@@ -81,10 +83,17 @@ impl<T: Float + FromJSValConvertible<Config=()>> FromJSValConvertible for Finite
     unsafe fn from_jsval(cx: *mut JSContext,
                          value: HandleValue,
                          option: ())
-                         -> Result<Finite<T>, ()> {
-        let result = try!(FromJSValConvertible::from_jsval(cx, value, option));
+                         -> Result<ConversionResult<Finite<T>>, ()> {
+        let result = match FromJSValConvertible::from_jsval(cx, value, option) {
+            Ok(ConversionResult::Success(v)) => v,
+            Ok(ConversionResult::Failure(error)) => {
+                throw_type_error(cx, &error);
+                return Err(());
+            }
+            _ => return Err(()),
+        };
         match Finite::new(result) {
-            Some(v) => Ok(v),
+            Some(v) => Ok(ConversionResult::Success(v)),
             None => {
                 throw_type_error(cx, "this argument is not a finite floating-point value");
                 Err(())
@@ -96,25 +105,45 @@ impl<T: Float + FromJSValConvertible<Config=()>> FromJSValConvertible for Finite
 impl <T: Reflectable + IDLInterface> FromJSValConvertible for Root<T> {
     type Config = ();
 
-    unsafe fn from_jsval(cx: *mut JSContext,
+    unsafe fn from_jsval(_cx: *mut JSContext,
                          value: HandleValue,
                          _config: Self::Config)
-                         -> Result<Root<T>, ()> {
-        let result = root_from_handlevalue(value);
-        if let Err(()) = result {
-            throw_type_error(cx, "value is not an object");
-        }
-        result
+                         -> Result<ConversionResult<Root<T>>, ()> {
+        Ok(match root_from_handlevalue(value) {
+            Ok(result) => ConversionResult::Success(result),
+            Err(()) => ConversionResult::Failure("value is not an object".into()),
+        })
     }
 }
 
-/// Convert the given `jsid` to a `DOMString`. Fails if the `jsid` is not a
-/// string, or if the string does not contain valid UTF-16.
-pub fn jsid_to_str(cx: *mut JSContext, id: HandleId) -> DOMString {
+/// Convert `id` to a `DOMString`, assuming it is string-valued.
+///
+/// Handling of invalid UTF-16 in strings depends on the relevant option.
+///
+/// # Panics
+///
+/// Panics if `id` is not string-valued.
+pub fn string_jsid_to_string(cx: *mut JSContext, id: HandleId) -> DOMString {
     unsafe {
         assert!(RUST_JSID_IS_STRING(id));
         jsstring_to_str(cx, RUST_JSID_TO_STRING(id))
     }
+}
+
+/// Convert `id` to a `DOMString`. Returns `None` if `id` is not a string or
+/// integer.
+///
+/// Handling of invalid UTF-16 in strings depends on the relevant option.
+pub unsafe fn jsid_to_string(cx: *mut JSContext, id: HandleId) -> Option<DOMString> {
+    if RUST_JSID_IS_STRING(id) {
+        return Some(jsstring_to_str(cx, RUST_JSID_TO_STRING(id)));
+    }
+
+    if RUST_JSID_IS_INT(id) {
+        return Some(RUST_JSID_TO_INT(id).to_string().into());
+    }
+
+    None
 }
 
 // http://heycam.github.io/webidl/#es-USVString
@@ -146,17 +175,17 @@ impl FromJSValConvertible for DOMString {
     unsafe fn from_jsval(cx: *mut JSContext,
                          value: HandleValue,
                          null_behavior: StringificationBehavior)
-                         -> Result<DOMString, ()> {
+                         -> Result<ConversionResult<DOMString>, ()> {
         if null_behavior == StringificationBehavior::Empty &&
            value.get().is_null() {
-            Ok(DOMString::new())
+            Ok(ConversionResult::Success(DOMString::new()))
         } else {
             let jsstr = ToString(cx, value);
             if jsstr.is_null() {
                 debug!("ToString failed");
                 Err(())
             } else {
-                Ok(jsstring_to_str(cx, jsstr))
+                Ok(ConversionResult::Success(jsstring_to_str(cx, jsstr)))
             }
         }
     }
@@ -203,7 +232,8 @@ pub unsafe fn jsstring_to_str(cx: *mut JSContext, s: *mut JSString) -> DOMString
 // http://heycam.github.io/webidl/#es-USVString
 impl FromJSValConvertible for USVString {
     type Config = ();
-    unsafe fn from_jsval(cx: *mut JSContext, value: HandleValue, _: ()) -> Result<USVString, ()> {
+    unsafe fn from_jsval(cx: *mut JSContext, value: HandleValue, _: ())
+                         -> Result<ConversionResult<USVString>, ()> {
         let jsstr = ToString(cx, value);
         if jsstr.is_null() {
             debug!("ToString failed");
@@ -212,13 +242,14 @@ impl FromJSValConvertible for USVString {
         let latin1 = JS_StringHasLatin1Chars(jsstr);
         if latin1 {
             // FIXME(ajeffrey): Convert directly from DOMString to USVString
-            return Ok(USVString(String::from(jsstring_to_str(cx, jsstr))));
+            return Ok(ConversionResult::Success(
+                USVString(String::from(jsstring_to_str(cx, jsstr)))));
         }
         let mut length = 0;
         let chars = JS_GetTwoByteStringCharsAndLength(cx, ptr::null(), jsstr, &mut length);
         assert!(!chars.is_null());
         let char_vec = slice::from_raw_parts(chars as *const u16, length as usize);
-        Ok(USVString(String::from_utf16_lossy(char_vec)))
+        Ok(ConversionResult::Success(USVString(String::from_utf16_lossy(char_vec))))
     }
 }
 
@@ -241,7 +272,7 @@ impl FromJSValConvertible for ByteString {
     unsafe fn from_jsval(cx: *mut JSContext,
                          value: HandleValue,
                          _option: ())
-                         -> Result<ByteString, ()> {
+                         -> Result<ConversionResult<ByteString>, ()> {
         let string = ToString(cx, value);
         if string.is_null() {
             debug!("ToString failed");
@@ -255,7 +286,7 @@ impl FromJSValConvertible for ByteString {
             assert!(!chars.is_null());
 
             let char_slice = slice::from_raw_parts(chars as *mut u8, length as usize);
-            return Ok(ByteString::new(char_slice.to_vec()));
+            return Ok(ConversionResult::Success(ByteString::new(char_slice.to_vec())));
         }
 
         let mut length = 0;
@@ -266,7 +297,8 @@ impl FromJSValConvertible for ByteString {
             throw_type_error(cx, "Invalid ByteString");
             Err(())
         } else {
-            Ok(ByteString::new(char_vec.iter().map(|&c| c as u8).collect()))
+            Ok(ConversionResult::Success(
+                ByteString::new(char_vec.iter().map(|&c| c as u8).collect())))
         }
     }
 }

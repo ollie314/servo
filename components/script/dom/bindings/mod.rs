@@ -128,15 +128,20 @@
 //! return `Err()` from the method with the appropriate [error value]
 //! (error/enum.Error.html).
 
+pub use style::domrefcell as cell;
+
 pub mod callback;
-pub mod cell;
+pub mod constant;
 pub mod conversions;
 pub mod error;
 pub mod global;
 pub mod guard;
 pub mod inheritance;
 pub mod interface;
+pub mod iterable;
 pub mod js;
+pub mod mozmap;
+pub mod namespace;
 pub mod num;
 pub mod proxyhandler;
 pub mod refcounted;

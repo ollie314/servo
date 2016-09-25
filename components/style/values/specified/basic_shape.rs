@@ -8,15 +8,15 @@
 //! [basic-shape]: https://drafts.csswg.org/css-shapes/#typedef-basic-shape
 
 use cssparser::{Parser, ToCss};
-use parser::{ParserContext, Parse};
+use parser::{Parse, ParserContext};
 use properties::shorthands::{parse_four_sides, serialize_four_sides};
 use std::fmt;
 use url::Url;
+use values::computed::{ComputedValueAsSpecified, Context, ToComputedValue};
 use values::computed::basic_shape as computed_basic_shape;
-use values::computed::{Context, ToComputedValue, ComputedValueAsSpecified};
-use values::specified::UrlExtraData;
-use values::specified::position::Position;
 use values::specified::{BorderRadiusSize, LengthOrPercentage, Percentage};
+use values::specified::UrlExtraData;
+use values::specified::position::{Keyword, Position};
 
 /// A shape source, for some reference box
 ///
@@ -94,6 +94,7 @@ impl<T: Parse + PartialEq + Copy> ShapeSource<T> {
 
 impl<T: ToComputedValue> ToComputedValue for ShapeSource<T> {
     type ComputedValue = computed_basic_shape::ShapeSource<T::ComputedValue>;
+
     #[inline]
     fn to_computed_value(&self, cx: &Context) -> Self::ComputedValue {
         match *self {
@@ -109,6 +110,24 @@ impl<T: ToComputedValue> ToComputedValue for ShapeSource<T> {
                 computed_basic_shape::ShapeSource::Box(reference.to_computed_value(cx))
             }
             ShapeSource::None => computed_basic_shape::ShapeSource::None,
+        }
+    }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        match *computed {
+            computed_basic_shape::ShapeSource::Url(ref url, ref data) => {
+                ShapeSource::Url(url.clone(), data.clone())
+            }
+            computed_basic_shape::ShapeSource::Shape(ref shape, ref reference) => {
+                ShapeSource::Shape(
+                    ToComputedValue::from_computed_value(shape),
+                    reference.as_ref().map(|r| ToComputedValue::from_computed_value(r)))
+            }
+            computed_basic_shape::ShapeSource::Box(ref reference) => {
+                ShapeSource::Box(ToComputedValue::from_computed_value(reference))
+            }
+            computed_basic_shape::ShapeSource::None => ShapeSource::None,
         }
     }
 }
@@ -167,6 +186,23 @@ impl ToComputedValue for BasicShape {
             BasicShape::Circle(circle) => computed_basic_shape::BasicShape::Circle(circle.to_computed_value(cx)),
             BasicShape::Ellipse(e) => computed_basic_shape::BasicShape::Ellipse(e.to_computed_value(cx)),
             BasicShape::Polygon(ref poly) => computed_basic_shape::BasicShape::Polygon(poly.to_computed_value(cx)),
+        }
+    }
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        match *computed {
+            computed_basic_shape::BasicShape::Inset(ref rect) => {
+                BasicShape::Inset(ToComputedValue::from_computed_value(rect))
+            }
+            computed_basic_shape::BasicShape::Circle(ref circle) => {
+                BasicShape::Circle(ToComputedValue::from_computed_value(circle))
+            }
+            computed_basic_shape::BasicShape::Ellipse(ref e) => {
+                BasicShape::Ellipse(ToComputedValue::from_computed_value(e))
+            }
+            computed_basic_shape::BasicShape::Polygon(ref poly) => {
+                BasicShape::Polygon(ToComputedValue::from_computed_value(poly))
+            }
         }
     }
 }
@@ -239,6 +275,100 @@ impl ToComputedValue for InsetRect {
             round: self.round.map(|r| r.to_computed_value(cx)),
         }
     }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        InsetRect {
+            top: ToComputedValue::from_computed_value(&computed.top),
+            right: ToComputedValue::from_computed_value(&computed.right),
+            bottom: ToComputedValue::from_computed_value(&computed.bottom),
+            left: ToComputedValue::from_computed_value(&computed.left),
+            round: computed.round.map(|ref r| ToComputedValue::from_computed_value(r)),
+        }
+    }
+}
+
+/// https://drafts.csswg.org/css-shapes/#basic-shape-serialization
+///
+/// Positions get serialized differently with basic shapes. Keywords
+/// are converted to percentages where possible. Only the two or four
+/// value forms are used. In case of two keyword-percentage pairs,
+/// the keywords are folded into the percentages
+fn serialize_basicshape_position<W>(position: &Position, dest: &mut W)
+    -> fmt::Result where W: fmt::Write {
+        use values::specified::Length;
+        use values::specified::position::Keyword;
+
+        // keyword-percentage pairs can be folded into a single percentage
+        fn fold_keyword(keyword: Option<Keyword>, length: Option<LengthOrPercentage>)
+            -> Option<LengthOrPercentage> {
+            let pc = match length.map(replace_with_percent) {
+                None => Percentage(0.0), // unspecified length = 0%
+                Some(LengthOrPercentage::Percentage(pc)) => pc,
+                _ => return None
+            };
+            let percent = match keyword {
+                Some(Keyword::Center) => {
+                    // center cannot pair with lengths
+                    assert!(length.is_none());
+                    Percentage(0.5)
+                },
+                Some(Keyword::Left) | Some(Keyword::Top) | None => pc,
+                Some(Keyword::Right) | Some(Keyword::Bottom) => Percentage(1.0 - pc.0),
+            };
+            Some(LengthOrPercentage::Percentage(percent))
+        }
+
+        // 0 length should be replaced with 0%
+        fn replace_with_percent(input: LengthOrPercentage) -> LengthOrPercentage {
+            match input {
+                LengthOrPercentage::Length(Length::Absolute(au)) if au.0 == 0 => {
+                    LengthOrPercentage::Percentage(Percentage(0.0))
+                }
+                _ => {
+                    input
+                }
+            }
+        }
+
+        fn serialize_position_pair<W>(x: LengthOrPercentage, y: LengthOrPercentage,
+                                      dest: &mut W) -> fmt::Result where W: fmt::Write {
+            try!(replace_with_percent(x).to_css(dest));
+            try!(dest.write_str(" "));
+            replace_with_percent(y).to_css(dest)
+        }
+
+        match (position.horiz_keyword, position.horiz_position,
+               position.vert_keyword, position.vert_position) {
+            (Some(hk), None, Some(vk), None) => {
+                // two keywords: serialize as two lengths
+                serialize_position_pair(hk.to_length_or_percentage(),
+                                        vk.to_length_or_percentage(),
+                                        dest)
+            }
+            (None, Some(hp), None, Some(vp)) => {
+                // two lengths: just serialize regularly
+                serialize_position_pair(hp, vp, dest)
+            }
+            (hk, hp, vk, vp) => {
+                // only fold if both fold; the three-value form isn't
+                // allowed here.
+                if let (Some(x), Some(y)) = (fold_keyword(hk, hp), fold_keyword(vk, vp)) {
+                    serialize_position_pair(x, y, dest)
+                } else {
+                    // We failed to reduce it to a two-value form,
+                    // so we expand it to 4-value
+                    let zero = LengthOrPercentage::Percentage(Percentage(0.0));
+                    try!(hk.unwrap_or(Keyword::Left).to_css(dest));
+                    try!(dest.write_str(" "));
+                    try!(replace_with_percent(hp.unwrap_or(zero)).to_css(dest));
+                    try!(dest.write_str(" "));
+                    try!(vk.unwrap_or(Keyword::Top).to_css(dest));
+                    try!(dest.write_str(" "));
+                    replace_with_percent(vp.unwrap_or(zero)).to_css(dest)
+                }
+            }
+        }
 }
 
 #[derive(Clone, PartialEq, Copy, Debug)]
@@ -265,8 +395,10 @@ impl Circle {
         } else {
             // Defaults to origin
             Position {
-                horizontal: LengthOrPercentage::Percentage(Percentage(0.5)),
-                vertical: LengthOrPercentage::Percentage(Percentage(0.5)),
+                horiz_keyword: Some(Keyword::Center),
+                horiz_position: None,
+                vert_keyword: Some(Keyword::Center),
+                vert_position: None,
             }
         };
         Ok(Circle {
@@ -284,7 +416,7 @@ impl ToCss for Circle {
             try!(dest.write_str(" "));
         }
         try!(dest.write_str("at "));
-        try!(self.position.to_css(dest));
+        try!(serialize_basicshape_position(&self.position, dest));
         dest.write_str(")")
     }
 }
@@ -297,6 +429,14 @@ impl ToComputedValue for Circle {
         computed_basic_shape::Circle {
             radius: self.radius.to_computed_value(cx),
             position: self.position.to_computed_value(cx),
+        }
+    }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        Circle {
+            radius: ToComputedValue::from_computed_value(&computed.radius),
+            position: ToComputedValue::from_computed_value(&computed.position),
         }
     }
 }
@@ -329,8 +469,10 @@ impl Ellipse {
         } else {
             // Defaults to origin
             Position {
-                horizontal: LengthOrPercentage::Percentage(Percentage(0.5)),
-                vertical: LengthOrPercentage::Percentage(Percentage(0.5)),
+                horiz_keyword: Some(Keyword::Center),
+                horiz_position: None,
+                vert_keyword: Some(Keyword::Center),
+                vert_position: None,
             }
         };
         Ok(Ellipse {
@@ -351,7 +493,7 @@ impl ToCss for Ellipse {
             try!(dest.write_str(" "));
         }
         try!(dest.write_str("at "));
-        try!(self.position.to_css(dest));
+        try!(serialize_basicshape_position(&self.position, dest));
         dest.write_str(")")
     }
 }
@@ -365,6 +507,15 @@ impl ToComputedValue for Ellipse {
             semiaxis_x: self.semiaxis_x.to_computed_value(cx),
             semiaxis_y: self.semiaxis_y.to_computed_value(cx),
             position: self.position.to_computed_value(cx),
+        }
+    }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        Ellipse {
+            semiaxis_x: ToComputedValue::from_computed_value(&computed.semiaxis_x),
+            semiaxis_y: ToComputedValue::from_computed_value(&computed.semiaxis_y),
+            position: ToComputedValue::from_computed_value(&computed.position),
         }
     }
 }
@@ -441,6 +592,19 @@ impl ToComputedValue for Polygon {
                                          .collect(),
         }
     }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        Polygon {
+            fill: ToComputedValue::from_computed_value(&computed.fill),
+            coordinates: computed.coordinates.iter()
+                                             .map(|c| {
+                                                (ToComputedValue::from_computed_value(&c.0),
+                                                 ToComputedValue::from_computed_value(&c.1))
+                                             })
+                                         .collect(),
+        }
+    }
 }
 
 /// https://drafts.csswg.org/css-shapes/#typedef-shape-radius
@@ -493,6 +657,17 @@ impl ToComputedValue for ShapeRadius {
             }
             ShapeRadius::ClosestSide => computed_basic_shape::ShapeRadius::ClosestSide,
             ShapeRadius::FarthestSide => computed_basic_shape::ShapeRadius::FarthestSide,
+        }
+    }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        match *computed {
+            computed_basic_shape::ShapeRadius::Length(ref lop) => {
+                ShapeRadius::Length(ToComputedValue::from_computed_value(lop))
+            }
+            computed_basic_shape::ShapeRadius::ClosestSide => ShapeRadius::ClosestSide,
+            computed_basic_shape::ShapeRadius::FarthestSide => ShapeRadius::FarthestSide,
         }
     }
 }
@@ -585,6 +760,16 @@ impl ToComputedValue for BorderRadius {
             top_right: self.top_right.to_computed_value(cx),
             bottom_right: self.bottom_right.to_computed_value(cx),
             bottom_left: self.bottom_left.to_computed_value(cx),
+        }
+    }
+
+    #[inline]
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        BorderRadius {
+            top_left: ToComputedValue::from_computed_value(&computed.top_left),
+            top_right: ToComputedValue::from_computed_value(&computed.top_right),
+            bottom_right: ToComputedValue::from_computed_value(&computed.bottom_right),
+            bottom_left: ToComputedValue::from_computed_value(&computed.bottom_left),
         }
     }
 }

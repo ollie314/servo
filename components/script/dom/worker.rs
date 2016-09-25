@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use devtools_traits::{ScriptToDevtoolsControlMsg, DevtoolsPageInfo};
+use devtools_traits::{DevtoolsPageInfo, ScriptToDevtoolsControlMsg};
+use dom::abstractworker::{SharedRt, SimpleWorkerErrorHandler};
 use dom::abstractworker::WorkerScriptMsg;
-use dom::abstractworker::{SimpleWorkerErrorHandler, SharedRt, WorkerErrorHandler};
 use dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use dom::bindings::codegen::Bindings::WorkerBinding;
 use dom::bindings::codegen::Bindings::WorkerBinding::WorkerMethods;
-use dom::bindings::error::{Error, ErrorResult, Fallible};
+use dom::bindings::error::{Error, ErrorResult, Fallible, ErrorInfo};
 use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::Castable;
 use dom::bindings::js::Root;
@@ -23,14 +23,14 @@ use dom::eventtarget::EventTarget;
 use dom::messageevent::MessageEvent;
 use dom::workerglobalscope::prepare_workerscope_init;
 use ipc_channel::ipc;
-use js::jsapi::{HandleValue, JSContext, JSAutoCompartment};
+use js::jsapi::{HandleValue, JSAutoCompartment, JSContext, NullHandleValue};
 use js::jsval::UndefinedValue;
 use script_thread::Runnable;
 use script_traits::WorkerScriptLoadOrigin;
 use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
 
 pub type TrustedWorkerAddress = Trusted<Worker>;
 
@@ -85,13 +85,13 @@ impl Worker {
         let worker_load_origin = WorkerScriptLoadOrigin {
             referrer_url: None,
             referrer_policy: None,
-            pipeline_id: Some(global.pipeline())
+            pipeline_id: Some(global.pipeline_id()),
         };
 
         let (devtools_sender, devtools_receiver) = ipc::channel().unwrap();
         let worker_id = global.get_next_worker_id();
         if let Some(ref chan) = global.devtools_chan() {
-            let pipeline_id = global.pipeline();
+            let pipeline_id = global.pipeline_id();
                 let title = format!("Worker for {}", worker_url);
                 let page_info = DevtoolsPageInfo {
                     title: title,
@@ -105,7 +105,7 @@ impl Worker {
         let init = prepare_workerscope_init(global, Some(devtools_sender));
 
         DedicatedWorkerGlobalScope::run_worker_scope(
-            init, worker_url, global.pipeline(), devtools_receiver, worker.runtime.clone(), worker_ref,
+            init, worker_url, global.pipeline_id(), devtools_receiver, worker.runtime.clone(), worker_ref,
             global.script_chan(), sender, receiver, worker_load_origin, closing);
 
         Ok(worker)
@@ -140,20 +140,25 @@ impl Worker {
         worker.upcast().fire_simple_event("error");
     }
 
-    pub fn handle_error_message(address: TrustedWorkerAddress, message: DOMString,
-                                filename: DOMString, lineno: u32, colno: u32) {
-        let worker = address.root();
+    #[allow(unsafe_code)]
+    fn dispatch_error(&self, error_info: ErrorInfo) {
+        let global = self.global();
+        let event = ErrorEvent::new(global.r(),
+                                    atom!("error"),
+                                    EventBubbles::DoesNotBubble,
+                                    EventCancelable::Cancelable,
+                                    error_info.message.as_str().into(),
+                                    error_info.filename.as_str().into(),
+                                    error_info.lineno,
+                                    error_info.column,
+                                    unsafe { NullHandleValue });
 
-        if worker.is_terminated() {
+        let handled = !event.upcast::<Event>().fire(self.upcast::<EventTarget>());
+        if handled {
             return;
         }
 
-        let global = worker.r().global();
-        rooted!(in(global.r().get_cx()) let error = UndefinedValue());
-        let errorevent = ErrorEvent::new(global.r(), atom!("error"),
-                                         EventBubbles::Bubbles, EventCancelable::Cancelable,
-                                         message, filename, lineno, colno, error.handle());
-        errorevent.upcast::<Event>().fire(worker.upcast());
+        global.r().report_an_error(error_info, unsafe { NullHandleValue });
     }
 }
 
@@ -221,10 +226,23 @@ impl Runnable for SimpleWorkerErrorHandler<Worker> {
     }
 }
 
-impl Runnable for WorkerErrorHandler<Worker> {
-    #[allow(unrooted_must_root)]
-    fn handler(self: Box<WorkerErrorHandler<Worker>>) {
+pub struct WorkerErrorHandler {
+    address: Trusted<Worker>,
+    error_info: ErrorInfo,
+}
+
+impl WorkerErrorHandler {
+    pub fn new(address: Trusted<Worker>, error_info: ErrorInfo) -> WorkerErrorHandler {
+        WorkerErrorHandler {
+            address: address,
+            error_info: error_info,
+        }
+    }
+}
+
+impl Runnable for WorkerErrorHandler {
+    fn handler(self: Box<Self>) {
         let this = *self;
-        Worker::handle_error_message(this.addr, this.msg, this.file_name, this.line_num, this.col_num);
+        this.address.root().dispatch_error(this.error_info);
     }
 }

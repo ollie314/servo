@@ -17,8 +17,8 @@ use dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
 use dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
-use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::Bindings::WindowBinding::{ScrollBehavior, ScrollToOptions};
+use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::UnionTypes::NodeOrString;
 use dom::bindings::error::{Error, ErrorResult, Fallible};
 use dom::bindings::global::GlobalRef;
@@ -26,8 +26,8 @@ use dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, Nod
 use dom::bindings::js::{JS, LayoutJS, MutNullableHeap};
 use dom::bindings::js::{Root, RootedReference};
 use dom::bindings::str::DOMString;
-use dom::bindings::xmlname::XMLName::InvalidXMLName;
 use dom::bindings::xmlname::{namespace_from_domstring, validate_and_extract, xml_name_type};
+use dom::bindings::xmlname::XMLName::InvalidXMLName;
 use dom::characterdata::CharacterData;
 use dom::create::create_element;
 use dom::document::{Document, LayoutDocumentHelpers};
@@ -70,16 +70,15 @@ use html5ever::serialize::SerializeOpts;
 use html5ever::serialize::TraversalScope;
 use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
 use html5ever::tree_builder::{LimitedQuirks, NoQuirks, Quirks};
-use ref_filter_map::ref_filter_map;
-use selectors::matching::{DeclarationBlock, ElementFlags, matches};
-use selectors::matching::{HAS_SLOW_SELECTOR, HAS_EDGE_CHILD_SELECTOR, HAS_SLOW_SELECTOR_LATER_SIBLINGS};
+use selectors::matching::{ElementFlags, MatchingReason, matches};
+use selectors::matching::{HAS_EDGE_CHILD_SELECTOR, HAS_SLOW_SELECTOR, HAS_SLOW_SELECTOR_LATER_SIBLINGS};
 use selectors::parser::{AttrSelector, NamespaceConstraint, parse_author_origin_selector_list_from_str};
 use std::ascii::AsciiExt;
 use std::borrow::Cow;
-use std::cell::{Cell, Ref};
+use std::cell::Cell;
 use std::convert::TryFrom;
 use std::default::Default;
-use std::mem;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use string_cache::{Atom, Namespace, QualName};
@@ -87,10 +86,12 @@ use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 use style::element_state::*;
 use style::matching::{common_style_affecting_attributes, rare_style_affecting_attributes};
 use style::parser::ParserContextExtraData;
-use style::properties::DeclaredValue;
-use style::properties::longhands::{self, background_image, border_spacing, font_family, overflow_x, font_size};
+use style::properties::{DeclaredValue, Importance};
 use style::properties::{PropertyDeclaration, PropertyDeclarationBlock, parse_style_attribute};
+use style::properties::longhands::{self, background_image, border_spacing, font_family, font_size, overflow_x};
+use style::refcell::Ref;
 use style::selector_impl::{NonTSPseudoClass, ServoSelectorImpl};
+use style::selector_matching::ApplicableDeclarationBlock;
 use style::sink::Push;
 use style::values::CSSFloat;
 use style::values::specified::{self, CSSColor, CSSRGBA, LengthOrPercentage};
@@ -108,11 +109,21 @@ pub struct Element {
     prefix: Option<DOMString>,
     attrs: DOMRefCell<Vec<JS<Attr>>>,
     id_attribute: DOMRefCell<Option<Atom>>,
-    style_attribute: DOMRefCell<Option<PropertyDeclarationBlock>>,
+    style_attribute: DOMRefCell<Option<Arc<PropertyDeclarationBlock>>>,
     attr_list: MutNullableHeap<JS<NamedNodeMap>>,
     class_list: MutNullableHeap<JS<DOMTokenList>>,
     state: Cell<ElementState>,
     atomic_flags: AtomicElementFlags,
+}
+
+impl fmt::Debug for Element {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        try!(write!(f, "<{}", self.local_name));
+        if let Some(ref id) = *self.id_attribute.borrow() {
+            try!(write!(f, " id={}", id));
+        }
+        write!(f, ">")
+    }
 }
 
 #[derive(PartialEq, HeapSizeOf)]
@@ -280,13 +291,13 @@ pub trait LayoutElementHelpers {
 
     #[allow(unsafe_code)]
     unsafe fn synthesize_presentational_hints_for_legacy_attributes<V>(&self, &mut V)
-        where V: Push<DeclarationBlock<Vec<PropertyDeclaration>>>;
+        where V: Push<ApplicableDeclarationBlock>;
     #[allow(unsafe_code)]
     unsafe fn get_colspan(self) -> u32;
     #[allow(unsafe_code)]
     unsafe fn html_element_in_html_document_for_layout(&self) -> bool;
     fn id_attribute(&self) -> *const Option<Atom>;
-    fn style_attribute(&self) -> *const Option<PropertyDeclarationBlock>;
+    fn style_attribute(&self) -> *const Option<Arc<PropertyDeclarationBlock>>;
     fn local_name(&self) -> &Atom;
     fn namespace(&self) -> &Namespace;
     fn get_checked_state_for_layout(&self) -> bool;
@@ -313,11 +324,16 @@ impl LayoutElementHelpers for LayoutJS<Element> {
 
     #[allow(unsafe_code)]
     unsafe fn synthesize_presentational_hints_for_legacy_attributes<V>(&self, hints: &mut V)
-        where V: Push<DeclarationBlock<Vec<PropertyDeclaration>>>
+        where V: Push<ApplicableDeclarationBlock>
     {
         #[inline]
-        fn from_declaration(rule: PropertyDeclaration) -> DeclarationBlock<Vec<PropertyDeclaration>> {
-            DeclarationBlock::from_declarations(Arc::new(vec![rule]))
+        fn from_declaration(rule: PropertyDeclaration) -> ApplicableDeclarationBlock {
+            ApplicableDeclarationBlock::from_declarations(
+                Arc::new(PropertyDeclarationBlock {
+                    declarations: vec![(rule, Importance::Normal)],
+                    important_count: 0,
+                }),
+                Importance::Normal)
         }
 
         let bgcolor = if let Some(this) = self.downcast::<HTMLBodyElement>() {
@@ -349,8 +365,11 @@ impl LayoutElementHelpers for LayoutJS<Element> {
         if let Some(url) = background {
             hints.push(from_declaration(
                 PropertyDeclaration::BackgroundImage(DeclaredValue::Value(
-                    background_image::SpecifiedValue(Some(
-                        specified::Image::Url(url, specified::UrlExtraData { })))))));
+                    background_image::SpecifiedValue(vec![
+                        background_image::single_value::SpecifiedValue(Some(
+                            specified::Image::Url(url, specified::UrlExtraData { })
+                        ))
+                    ])))));
         }
 
         let color = if let Some(this) = self.downcast::<HTMLFontElement>() {
@@ -599,7 +618,7 @@ impl LayoutElementHelpers for LayoutJS<Element> {
     }
 
     #[allow(unsafe_code)]
-    fn style_attribute(&self) -> *const Option<PropertyDeclarationBlock> {
+    fn style_attribute(&self) -> *const Option<Arc<PropertyDeclarationBlock>> {
         unsafe {
             (*self.unsafe_get()).style_attribute.borrow_for_layout()
         }
@@ -660,13 +679,6 @@ impl LayoutElementHelpers for LayoutJS<Element> {
     }
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, HeapSizeOf)]
-pub enum StylePriority {
-    Important,
-    Normal,
-}
-
-
 impl Element {
     pub fn html_element_in_html_document(&self) -> bool {
         self.namespace == ns!(html) && self.upcast::<Node>().is_in_html_doc()
@@ -695,7 +707,7 @@ impl Element {
         self.attrs.borrow()
     }
 
-    pub fn style_attribute(&self) -> &DOMRefCell<Option<PropertyDeclarationBlock>> {
+    pub fn style_attribute(&self) -> &DOMRefCell<Option<Arc<PropertyDeclarationBlock>>> {
         &self.style_attribute
     }
 
@@ -756,20 +768,20 @@ impl Element {
         fn remove(element: &Element, property: &str) {
             let mut inline_declarations = element.style_attribute.borrow_mut();
             if let &mut Some(ref mut declarations) = &mut *inline_declarations {
-                let index = declarations.normal
-                                        .iter()
-                                        .position(|decl| decl.matches(property));
+                let mut importance = None;
+                let index = declarations.declarations.iter().position(|&(ref decl, i)| {
+                    let matching = decl.matches(property);
+                    if matching {
+                        importance = Some(i)
+                    }
+                    matching
+                });
                 if let Some(index) = index {
-                    Arc::make_mut(&mut declarations.normal).remove(index);
-                    return;
-                }
-
-                let index = declarations.important
-                                        .iter()
-                                        .position(|decl| decl.matches(property));
-                if let Some(index) = index {
-                    Arc::make_mut(&mut declarations.important).remove(index);
-                    return;
+                    let declarations = Arc::make_mut(declarations);
+                    declarations.declarations.remove(index);
+                    if importance.unwrap().important() {
+                        declarations.important_count -= 1;
+                    }
                 }
             }
         }
@@ -780,81 +792,82 @@ impl Element {
 
     pub fn update_inline_style(&self,
                                declarations: Vec<PropertyDeclaration>,
-                               style_priority: StylePriority) {
-        fn update(element: &Element, mut declarations: Vec<PropertyDeclaration>, style_priority: StylePriority) {
+                               importance: Importance) {
+        fn update(element: &Element, declarations: Vec<PropertyDeclaration>,
+                  importance: Importance) {
             let mut inline_declarations = element.style_attribute().borrow_mut();
-            if let &mut Some(ref mut existing_declarations) = &mut *inline_declarations {
-                let existing_declarations = if style_priority == StylePriority::Important {
-                    &mut existing_declarations.important
-                } else {
-                    &mut existing_declarations.normal
-                };
+            if let &mut Some(ref mut declaration_block) = &mut *inline_declarations {
+                {
+                    // Usually, the reference count will be 1 here. But transitions could make it greater
+                    // than that.
+                    let declaration_block = Arc::make_mut(declaration_block);
+                    let existing_declarations = &mut declaration_block.declarations;
 
-                // Usually, the reference count will be 1 here. But transitions could make it greater
-                // than that.
-                let existing_declarations = Arc::make_mut(existing_declarations);
-
-                while let Some(mut incoming_declaration) = declarations.pop() {
-                    let mut replaced = false;
-                    for existing_declaration in &mut *existing_declarations {
-                        if existing_declaration.name() == incoming_declaration.name() {
-                            mem::swap(existing_declaration, &mut incoming_declaration);
-                            replaced = true;
-                            break;
+                    'outer: for incoming_declaration in declarations {
+                        for existing_declaration in &mut *existing_declarations {
+                            if existing_declaration.0.name() == incoming_declaration.name() {
+                                match (existing_declaration.1, importance) {
+                                    (Importance::Normal, Importance::Important) => {
+                                        declaration_block.important_count += 1;
+                                    }
+                                    (Importance::Important, Importance::Normal) => {
+                                        declaration_block.important_count -= 1;
+                                    }
+                                    _ => {}
+                                }
+                                *existing_declaration = (incoming_declaration, importance);
+                                continue 'outer;
+                            }
+                        }
+                        existing_declarations.push((incoming_declaration, importance));
+                        if importance.important() {
+                            declaration_block.important_count += 1;
                         }
                     }
-
-                    if !replaced {
-                        // inserting instead of pushing since the declarations are in reverse order
-                        existing_declarations.insert(0, incoming_declaration);
-                    }
                 }
-
                 return;
             }
 
-            let (important, normal) = if style_priority == StylePriority::Important {
-                (declarations, vec![])
+            let important_count = if importance.important() {
+                declarations.len() as u32
             } else {
-                (vec![], declarations)
+                0
             };
 
-            *inline_declarations = Some(PropertyDeclarationBlock {
-                important: Arc::new(important),
-                normal: Arc::new(normal),
-            });
+            *inline_declarations = Some(Arc::new(PropertyDeclarationBlock {
+                declarations: declarations.into_iter().map(|d| (d, importance)).collect(),
+                important_count: important_count,
+            }));
         }
 
-        update(self, declarations, style_priority);
+        update(self, declarations, importance);
         self.sync_property_with_attrs_style();
     }
 
     pub fn set_inline_style_property_priority(&self,
                                               properties: &[&str],
-                                              style_priority: StylePriority) {
+                                              new_importance: Importance) {
         {
             let mut inline_declarations = self.style_attribute().borrow_mut();
-            if let &mut Some(ref mut declarations) = &mut *inline_declarations {
-              let (from, to) = if style_priority == StylePriority::Important {
-                  (&mut declarations.normal, &mut declarations.important)
-              } else {
-                  (&mut declarations.important, &mut declarations.normal)
-              };
-
-              // Usually, the reference counts of `from` and `to` will be 1 here. But transitions
-              // could make them greater than that.
-              let from = Arc::make_mut(from);
-              let to = Arc::make_mut(to);
-              let mut new_from = Vec::new();
-              for declaration in from.drain(..) {
-                  let name = declaration.name();
-                  if properties.iter().any(|p| name == **p) {
-                      to.push(declaration)
-                  } else {
-                      new_from.push(declaration)
-                  }
-              }
-              mem::replace(from, new_from);
+            if let &mut Some(ref mut block) = &mut *inline_declarations {
+                // Usually, the reference counts of `from` and `to` will be 1 here. But transitions
+                // could make them greater than that.
+                let block = Arc::make_mut(block);
+                let declarations = &mut block.declarations;
+                for &mut (ref declaration, ref mut importance) in declarations {
+                    if properties.iter().any(|p| declaration.name() == **p) {
+                        match (*importance, new_importance) {
+                            (Importance::Normal, Importance::Important) => {
+                                block.important_count += 1;
+                            }
+                            (Importance::Important, Importance::Normal) => {
+                                block.important_count -= 1;
+                            }
+                            _ => {}
+                        }
+                        *importance = new_importance;
+                    }
+                }
             }
         }
 
@@ -863,25 +876,12 @@ impl Element {
 
     pub fn get_inline_style_declaration(&self,
                                         property: &Atom)
-                                        -> Option<Ref<PropertyDeclaration>> {
-        ref_filter_map(self.style_attribute.borrow(), |inline_declarations| {
+                                        -> Option<Ref<(PropertyDeclaration, Importance)>> {
+        Ref::filter_map(self.style_attribute.borrow(), |inline_declarations| {
             inline_declarations.as_ref().and_then(|declarations| {
-                declarations.normal
+                declarations.declarations
                             .iter()
-                            .chain(declarations.important.iter())
-                            .find(|decl| decl.matches(&property))
-            })
-        })
-    }
-
-    pub fn get_important_inline_style_declaration(&self,
-                                                  property: &Atom)
-                                                  -> Option<Ref<PropertyDeclaration>> {
-        ref_filter_map(self.style_attribute.borrow(), |inline_declarations| {
-            inline_declarations.as_ref().and_then(|declarations| {
-                declarations.important
-                            .iter()
-                            .find(|decl| decl.matches(&property))
+                            .find(|&&(ref decl, _)| decl.matches(&property))
             })
         })
     }
@@ -2006,7 +2006,7 @@ impl ElementMethods for Element {
         match parse_author_origin_selector_list_from_str(&selectors) {
             Err(()) => Err(Error::Syntax),
             Ok(ref selectors) => {
-                Ok(matches(selectors, &Root::from_ref(self), None))
+                Ok(matches(selectors, &Root::from_ref(self), None, MatchingReason::Other))
             }
         }
     }
@@ -2024,7 +2024,7 @@ impl ElementMethods for Element {
                 let root = self.upcast::<Node>();
                 for element in root.inclusive_ancestors() {
                     if let Some(element) = Root::downcast::<Element>(element) {
-                        if matches(selectors, &element, None) {
+                        if matches(selectors, &element, None, MatchingReason::Other) {
                             return Ok(Some(element));
                         }
                     }
@@ -2087,6 +2087,27 @@ impl ElementMethods for Element {
         // Step 4.
         self.insert_adjacent(position, fragment.upcast()).map(|_| ())
     }
+
+    // check-tidy: no specs after this line
+    fn EnterFormalActivationState(&self) -> ErrorResult {
+        match self.as_maybe_activatable() {
+            Some(a) => {
+                a.enter_formal_activation_state();
+                return Ok(());
+            },
+            None => return Err(Error::NotSupported)
+        }
+    }
+
+    fn ExitFormalActivationState(&self) -> ErrorResult {
+        match self.as_maybe_activatable() {
+            Some(a) => {
+                a.exit_formal_activation_state();
+                return Ok(());
+            },
+            None => return Err(Error::NotSupported)
+        }
+    }
 }
 
 pub fn fragment_affecting_attributes() -> [Atom; 3] {
@@ -2108,8 +2129,11 @@ impl VirtualMethods for Element {
                 *self.style_attribute.borrow_mut() =
                     mutation.new_value(attr).map(|value| {
                         let win = window_from_node(self);
-                        parse_style_attribute(&value, &doc.base_url(), win.css_error_reporter(),
-                                              ParserContextExtraData::default())
+                        Arc::new(parse_style_attribute(
+                            &value,
+                            &doc.base_url(),
+                            win.css_error_reporter(),
+                            ParserContextExtraData::default()))
                     });
                 if node.is_in_doc() {
                     node.dirty(NodeDamage::NodeStyleDamaged);

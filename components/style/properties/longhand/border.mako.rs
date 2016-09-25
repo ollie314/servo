@@ -65,6 +65,11 @@
             fn to_computed_value(&self, context: &Context) -> computed_value::T {
                 self.0.to_computed_value(context)
             }
+
+            #[inline]
+            fn from_computed_value(computed: &computed_value::T) -> Self {
+                SpecifiedValue(ToComputedValue::from_computed_value(computed))
+            }
         }
     </%helpers:longhand>
 % endfor
@@ -78,6 +83,7 @@
 % endfor
 
 ${helpers.single_keyword("box-decoration-break", "slice clone",
+                         gecko_enum_prefix="StyleBoxDecorationBreak",
                          products="gecko", animatable=False)}
 
 ${helpers.single_keyword("-moz-float-edge", "content-box margin-box",

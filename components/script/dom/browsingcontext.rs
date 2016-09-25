@@ -7,7 +7,7 @@ use dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use dom::bindings::conversions::{ToJSValConvertible, root_from_handleobject};
 use dom::bindings::js::{JS, Root, RootedReference};
 use dom::bindings::proxyhandler::{fill_property_descriptor, get_property_descriptor};
-use dom::bindings::reflector::{Reflectable, Reflector};
+use dom::bindings::reflector::{Reflectable, MutReflectable, Reflector};
 use dom::bindings::str::DOMString;
 use dom::bindings::trace::JSTraceable;
 use dom::bindings::utils::WindowProxyHandler;
@@ -18,13 +18,15 @@ use dom::window::Window;
 use js::JSCLASS_IS_GLOBAL;
 use js::glue::{CreateWrapperProxyHandler, ProxyTraps, NewWindowProxy};
 use js::glue::{GetProxyPrivate, SetProxyExtra, GetProxyExtra};
-use js::jsapi::{Handle, HandleId, HandleObject, HandleValue, JSAutoCompartment};
-use js::jsapi::{JSContext, JSPROP_READONLY, JSErrNum, JSObject, PropertyDescriptor, JS_DefinePropertyById};
-use js::jsapi::{JS_ForwardGetPropertyTo, JS_ForwardSetPropertyTo, JS_GetClass, JSTracer, FreeOp};
-use js::jsapi::{JS_GetOwnPropertyDescriptorById, JS_HasPropertyById, MutableHandle};
-use js::jsapi::{MutableHandleObject, MutableHandleValue, ObjectOpResult};
+use js::jsapi::{Handle, HandleId, HandleObject, HandleValue};
+use js::jsapi::{JSAutoCompartment, JSContext, JSErrNum, JSFreeOp, JSObject};
+use js::jsapi::{JSPROP_READONLY, JSTracer, JS_DefinePropertyById};
+use js::jsapi::{JS_ForwardGetPropertyTo, JS_ForwardSetPropertyTo, JS_GetClass};
+use js::jsapi::{JS_GetOwnPropertyDescriptorById, JS_HasPropertyById};
+use js::jsapi::{MutableHandle, MutableHandleObject, MutableHandleValue};
+use js::jsapi::{ObjectOpResult, PropertyDescriptor};
 use js::jsval::{UndefinedValue, PrivateValue};
-use msg::constellation_msg::{PipelineId, SubpageId};
+use msg::constellation_msg::PipelineId;
 use std::cell::Cell;
 use url::Url;
 
@@ -150,7 +152,7 @@ impl BrowsingContext {
         old
     }
 
-    pub fn pipeline(&self) -> PipelineId {
+    pub fn pipeline_id(&self) -> PipelineId {
         self.id
     }
 
@@ -158,10 +160,10 @@ impl BrowsingContext {
         self.children.borrow_mut().push(JS::from_ref(&context));
     }
 
-    pub fn find_child_by_subpage(&self, subpage_id: SubpageId) -> Option<Root<Window>> {
+    pub fn find_child_by_id(&self, pipeline_id: PipelineId) -> Option<Root<Window>> {
         self.children.borrow().iter().find(|context| {
             let window = context.active_window();
-            window.subpage() == Some(subpage_id)
+            window.pipeline_id() == pipeline_id
         }).map(|context| context.active_window())
     }
 
@@ -409,7 +411,7 @@ static PROXY_HANDLER: ProxyTraps = ProxyTraps {
 };
 
 #[allow(unsafe_code)]
-unsafe extern fn finalize(_fop: *mut FreeOp, obj: *mut JSObject) {
+unsafe extern fn finalize(_fop: *mut JSFreeOp, obj: *mut JSObject) {
     let this = GetProxyExtra(obj, 0).to_private() as *mut BrowsingContext;
     assert!(!this.is_null());
     let _ = Box::from_raw(this);

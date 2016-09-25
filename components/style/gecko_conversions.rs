@@ -11,17 +11,19 @@
 use app_units::Au;
 use gecko_bindings::bindings::{RawServoStyleSheet, ServoComputedValues};
 use gecko_bindings::structs::nsStyleCoord_CalcValue;
-use gecko_bindings::sugar::refptr::HasArcFFI;
+use gecko_bindings::sugar::ownership::{HasArcFFI, HasFFI};
 use properties::ComputedValues;
 use stylesheets::Stylesheet;
-use values::computed::{CalcLengthOrPercentage, LengthOrPercentage};
+use values::computed::{CalcLengthOrPercentage, LengthOrPercentage, LengthOrPercentageOrAuto};
 
-unsafe impl HasArcFFI for Stylesheet {
+unsafe impl HasFFI for Stylesheet {
     type FFIType = RawServoStyleSheet;
 }
-unsafe impl HasArcFFI for ComputedValues {
+unsafe impl HasArcFFI for Stylesheet {}
+unsafe impl HasFFI for ComputedValues {
     type FFIType = ServoComputedValues;
 }
+unsafe impl HasArcFFI for ComputedValues {}
 
 impl From<CalcLengthOrPercentage> for nsStyleCoord_CalcValue {
     fn from(other: CalcLengthOrPercentage) -> nsStyleCoord_CalcValue {
@@ -70,6 +72,29 @@ impl From<LengthOrPercentage> for nsStyleCoord_CalcValue {
     }
 }
 
+impl LengthOrPercentageOrAuto {
+    pub fn to_calc_value(&self) -> Option<nsStyleCoord_CalcValue> {
+        match *self {
+            LengthOrPercentageOrAuto::Length(au) => {
+                Some(nsStyleCoord_CalcValue {
+                    mLength: au.0,
+                    mPercent: 0.0,
+                    mHasPercent: false,
+                })
+            },
+            LengthOrPercentageOrAuto::Percentage(pc) => {
+                Some(nsStyleCoord_CalcValue {
+                    mLength: 0,
+                    mPercent: pc,
+                    mHasPercent: true,
+                })
+            },
+            LengthOrPercentageOrAuto::Calc(calc) => Some(calc.into()),
+            LengthOrPercentageOrAuto::Auto => None,
+        }
+    }
+}
+
 impl From<nsStyleCoord_CalcValue> for LengthOrPercentage {
     fn from(other: nsStyleCoord_CalcValue) -> LengthOrPercentage {
         match (other.mHasPercent, other.mLength) {
@@ -82,15 +107,16 @@ impl From<nsStyleCoord_CalcValue> for LengthOrPercentage {
 
 pub mod basic_shape {
     use euclid::size::Size2D;
-    use gecko_bindings::structs::StyleClipPathGeometryBox;
+    use gecko_bindings::structs;
     use gecko_bindings::structs::{StyleBasicShape, StyleBasicShapeType, StyleFillRule};
-    use gecko_bindings::structs::{nsStyleCoord, nsStyleCorners, nsStyleImageLayers_Position};
+    use gecko_bindings::structs::{nsStyleCoord, nsStyleCorners};
+    use gecko_bindings::structs::StyleClipPathGeometryBox;
     use gecko_bindings::sugar::ns_style_coord::{CoordDataMut, CoordDataValue};
     use gecko_values::GeckoStyleCoordConvertible;
     use std::borrow::Borrow;
-    use values::computed::basic_shape::*;
-    use values::computed::position::Position;
     use values::computed::{BorderRadiusSize, LengthOrPercentage};
+    use values::computed::basic_shape::*;
+    use values::computed::position;
 
     // using Borrow so that we can have a non-moving .into()
     impl<T: Borrow<StyleBasicShape>> From<T> for BasicShape {
@@ -196,10 +222,10 @@ pub mod basic_shape {
     }
 
     // Can't be a From impl since we need to set an existing
-    // nsStyleImageLayers_Position, not create a new one
-    impl From<Position> for nsStyleImageLayers_Position {
-        fn from(other: Position) -> Self {
-            nsStyleImageLayers_Position {
+    // Position, not create a new one
+    impl From<position::Position> for structs::Position {
+        fn from(other: position::Position) -> Self {
+            structs::Position {
                 mXPosition: other.horizontal.into(),
                 mYPosition: other.vertical.into()
             }
@@ -214,10 +240,10 @@ pub mod basic_shape {
         }
     }
 
-    impl<T: Borrow<nsStyleImageLayers_Position>> From<T> for Position {
+    impl<T: Borrow<structs::Position>> From<T> for position::Position {
         fn from(other: T) -> Self {
             let other = other.borrow();
-            Position {
+            position::Position {
                 horizontal: other.mXPosition.into(),
                 vertical: other.mYPosition.into(),
             }

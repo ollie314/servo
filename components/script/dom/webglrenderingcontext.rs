@@ -3,12 +3,13 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use canvas_traits::{CanvasCommonMsg, CanvasMsg, byte_swap};
+use core::nonzero::NonZero;
+use dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::{self, WebGLContextAttributes};
 use dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLRenderingContextConstants as constants;
 use dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLRenderingContextMethods;
-use dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::{self, WebGLContextAttributes};
 use dom::bindings::codegen::UnionTypes::ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement;
 use dom::bindings::conversions::{ToJSValConvertible, array_buffer_view_data, array_buffer_view_data_checked};
-use dom::bindings::conversions::{array_buffer_view_to_vec_checked, array_buffer_view_to_vec};
+use dom::bindings::conversions::{array_buffer_view_to_vec, array_buffer_view_to_vec_checked};
 use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::Castable;
 use dom::bindings::js::{JS, LayoutJS, MutNullableHeap, Root};
@@ -21,7 +22,7 @@ use dom::node::{Node, NodeDamage, window_from_node};
 use dom::webgl_validations::WebGLValidator;
 use dom::webgl_validations::tex_image_2d::{CommonTexImage2DValidator, CommonTexImage2DValidatorResult};
 use dom::webgl_validations::tex_image_2d::{TexImage2DValidator, TexImage2DValidatorResult};
-use dom::webgl_validations::types::{TexFormat, TexImageTarget, TexDataType};
+use dom::webgl_validations::types::{TexDataType, TexFormat, TexImageTarget};
 use dom::webglactiveinfo::WebGLActiveInfo;
 use dom::webglbuffer::WebGLBuffer;
 use dom::webglcontextevent::WebGLContextEvent;
@@ -33,15 +34,15 @@ use dom::webgltexture::{TexParameterValue, WebGLTexture};
 use dom::webgluniformlocation::WebGLUniformLocation;
 use euclid::size::Size2D;
 use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::{JSContext, JS_GetArrayBufferViewType, JSObject, Type};
+use js::jsapi::{JSContext, JSObject, JS_GetArrayBufferViewType, Type};
 use js::jsval::{BooleanValue, DoubleValue, Int32Value, JSVal, NullValue, UndefinedValue};
 use net_traits::image::base::PixelFormat;
 use net_traits::image_cache_thread::ImageResponse;
 use offscreen_gl_context::{GLContextAttributes, GLLimits};
 use script_traits::ScriptMsg as ConstellationMsg;
 use std::cell::Cell;
-use webrender_traits::WebGLError::*;
 use webrender_traits::{WebGLCommand, WebGLError, WebGLFramebufferBindingRequest, WebGLParameter};
+use webrender_traits::WebGLError::*;
 
 type ImagePixelResult = Result<(Vec<u8>, Size2D<i32>), ()>;
 pub const MAX_UNIFORM_AND_ATTRIBUTE_LEN: usize = 256;
@@ -58,6 +59,38 @@ macro_rules! handle_potential_webgl_error {
     };
     ($context:ident, $call:expr) => {
         handle_potential_webgl_error!($context, $call, ());
+    };
+}
+
+// From the GLES 2.0.25 spec, page 85:
+//
+//     "If a texture that is currently bound to one of the targets
+//      TEXTURE_2D, or TEXTURE_CUBE_MAP is deleted, it is as though
+//      BindTexture had been executed with the same target and texture
+//      zero."
+//
+// and similar text occurs for other object types.
+macro_rules! handle_object_deletion {
+    ($binding:expr, $object:ident) => {
+        if let Some(bound_object) = $binding.get() {
+            if bound_object.id() == $object.id() {
+                $binding.set(None);
+            }
+        }
+    };
+}
+
+macro_rules! object_binding_to_js_or_null {
+    ($cx: expr, $binding:expr) => {
+        {
+            rooted!(in($cx) let mut rval = NullValue());
+            if let Some(bound_object) = $binding.get() {
+                unsafe {
+                    bound_object.to_jsval($cx, rval.handle_mut());
+                }
+            }
+            rval.get()
+        }
     };
 }
 
@@ -83,6 +116,7 @@ pub struct WebGLRenderingContext {
     last_error: Cell<Option<WebGLError>>,
     texture_unpacking_settings: Cell<TextureUnpacking>,
     bound_framebuffer: MutNullableHeap<JS<WebGLFramebuffer>>,
+    bound_renderbuffer: MutNullableHeap<JS<WebGLRenderbuffer>>,
     bound_texture_2d: MutNullableHeap<JS<WebGLTexture>>,
     bound_texture_cube_map: MutNullableHeap<JS<WebGLTexture>>,
     bound_buffer_array: MutNullableHeap<JS<WebGLBuffer>>,
@@ -117,6 +151,7 @@ impl WebGLRenderingContext {
                 bound_texture_cube_map: MutNullableHeap::new(None),
                 bound_buffer_array: MutNullableHeap::new(None),
                 bound_buffer_element_array: MutNullableHeap::new(None),
+                bound_renderbuffer: MutNullableHeap::new(None),
                 current_program: MutNullableHeap::new(None),
                 current_vertex_attrib_0: Cell::new((0f32, 0f32, 0f32, 1f32)),
             }
@@ -174,6 +209,38 @@ impl WebGLRenderingContext {
         // recorded until `getError` has been called
         if self.last_error.get().is_none() {
             self.last_error.set(Some(err));
+        }
+    }
+
+    // Helper function for validating framebuffer completeness in
+    // calls touching the framebuffer.  From the GLES 2.0.25 spec,
+    // page 119:
+    //
+    //    "Effects of Framebuffer Completeness on Framebuffer
+    //     Operations
+    //
+    //     If the currently bound framebuffer is not framebuffer
+    //     complete, then it is an error to attempt to use the
+    //     framebuffer for writing or reading. This means that
+    //     rendering commands such as DrawArrays and DrawElements, as
+    //     well as commands that read the framebuffer such as
+    //     ReadPixels and CopyTexSubImage, will generate the error
+    //     INVALID_FRAMEBUFFER_OPERATION if called while the
+    //     framebuffer is not framebuffer complete."
+    //
+    // The WebGL spec mentions a couple more operations that trigger
+    // this: clear() and getParameter(IMPLEMENTATION_COLOR_READ_*).
+    fn validate_framebuffer_complete(&self) -> bool {
+        match self.bound_framebuffer.get() {
+            Some(fb) => match fb.check_status() {
+                constants::FRAMEBUFFER_COMPLETE => return true,
+                _ => {
+                    self.webgl_error(InvalidFramebufferOperation);
+                    return false;
+                }
+            },
+            // The default framebuffer is always complete.
+            None => return true,
         }
     }
 
@@ -271,8 +338,7 @@ impl WebGLRenderingContext {
         // complexity is worth it.
         let (pixels, size) = match source {
             ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement::ImageData(image_data) => {
-                let global = self.global();
-                (image_data.get_data_array(&global.r()), image_data.get_size())
+                (image_data.get_data_array(), image_data.get_size())
             },
             ImageDataOrHTMLImageElementOrHTMLCanvasElementOrHTMLVideoElement::HTMLImageElement(image) => {
                 let img_url = match image.get_url() {
@@ -445,6 +511,19 @@ impl WebGLRenderingContext {
             .send(CanvasMsg::WebGL(msg))
             .unwrap()
     }
+
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14
+    fn validate_feature_enum(&self, cap: u32) -> bool {
+        match cap {
+            constants::BLEND | constants::CULL_FACE | constants::DEPTH_TEST | constants::DITHER |
+            constants::POLYGON_OFFSET_FILL | constants::SAMPLE_ALPHA_TO_COVERAGE | constants::SAMPLE_COVERAGE |
+            constants::SAMPLE_COVERAGE_INVERT | constants::SCISSOR_TEST => true,
+            _ => {
+                self.webgl_error(InvalidEnum);
+                false
+            },
+        }
+    }
 }
 
 impl Drop for WebGLRenderingContext {
@@ -513,19 +592,22 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     #[allow(unsafe_code)]
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
     fn GetParameter(&self, cx: *mut JSContext, parameter: u32) -> JSVal {
-        // Handle the GL_FRAMEBUFFER_BINDING without going all the way
+        // Handle the GL_*_BINDING without going all the way
         // to the GL, since we would just need to map back from GL's
-        // returned ID to the WebGLFramebuffer we're tracking.
+        // returned ID to the WebGL* object we're tracking.
         match parameter {
-            constants::FRAMEBUFFER_BINDING => {
-                rooted!(in(cx) let mut rval = NullValue());
-                if let Some(bound_fb) = self.bound_framebuffer.get() {
-                    unsafe {
-                        bound_fb.to_jsval(cx, rval.handle_mut());
-                    }
-                }
-                return rval.get()
-            }
+            constants::ARRAY_BUFFER_BINDING =>
+                return object_binding_to_js_or_null!(cx, &self.bound_buffer_array),
+            constants::ELEMENT_ARRAY_BUFFER_BINDING =>
+                return object_binding_to_js_or_null!(cx, &self.bound_buffer_element_array),
+            constants::FRAMEBUFFER_BINDING =>
+                return object_binding_to_js_or_null!(cx, &self.bound_framebuffer),
+            constants::RENDERBUFFER_BINDING =>
+                return object_binding_to_js_or_null!(cx, &self.bound_renderbuffer),
+            constants::TEXTURE_BINDING_2D =>
+                return object_binding_to_js_or_null!(cx, &self.bound_texture_2d),
+            constants::TEXTURE_BINDING_CUBE_MAP =>
+                return object_binding_to_js_or_null!(cx, &self.bound_texture_cube_map),
             _ => {}
         }
 
@@ -554,6 +636,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         let error_code = if let Some(error) = self.last_error.get() {
             match error {
                 WebGLError::InvalidEnum => constants::INVALID_ENUM,
+                WebGLError::InvalidFramebufferOperation => constants::INVALID_FRAMEBUFFER_OPERATION,
                 WebGLError::InvalidValue => constants::INVALID_VALUE,
                 WebGLError::InvalidOperation => constants::INVALID_OPERATION,
                 WebGLError::OutOfMemory => constants::OUT_OF_MEMORY,
@@ -595,8 +678,9 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.14
-    fn GetExtension(&self, _cx: *mut JSContext, _name: DOMString) -> *mut JSObject {
-        0 as *mut JSObject
+    fn GetExtension(&self, _cx: *mut JSContext, _name: DOMString)
+                    -> Option<NonZero<*mut JSObject>> {
+        None
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
@@ -705,13 +789,21 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             return self.webgl_error(InvalidEnum);
         }
 
-        if let Some(renderbuffer) = renderbuffer {
-            renderbuffer.bind(target)
-        } else {
-            // Unbind the currently bound renderbuffer
-            self.ipc_renderer
-                .send(CanvasMsg::WebGL(WebGLCommand::BindRenderbuffer(target, None)))
-                .unwrap()
+        match renderbuffer {
+            // Implementations differ on what to do in the deleted
+            // case: Chromium currently unbinds, and Gecko silently
+            // returns.  The conformance tests don't cover this case.
+            Some(renderbuffer) if !renderbuffer.is_deleted() => {
+                self.bound_renderbuffer.set(Some(renderbuffer));
+                renderbuffer.bind(target);
+            }
+            _ => {
+                self.bound_renderbuffer.set(None);
+                // Unbind the currently bound renderbuffer
+                self.ipc_renderer
+                    .send(CanvasMsg::WebGL(WebGLCommand::BindRenderbuffer(target, None)))
+                    .unwrap()
+            }
         }
     }
 
@@ -729,6 +821,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 Err(err) => return self.webgl_error(err),
             }
         } else {
+            slot.set(None);
             // Unbind the currently bound texture
             self.ipc_renderer
                 .send(CanvasMsg::WebGL(WebGLCommand::BindTexture(target, None)))
@@ -838,6 +931,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn CopyTexImage2D(&self, target: u32, level: i32, internal_format: u32,
                       x: i32, y: i32, width: i32, height: i32, border: i32) {
+        if !self.validate_framebuffer_complete() {
+            return;
+        }
+
         let validator = CommonTexImage2DValidator::new(self, target, level,
                                                        internal_format, width,
                                                        height, border);
@@ -891,6 +988,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn CopyTexSubImage2D(&self, target: u32, level: i32, xoffset: i32, yoffset: i32,
                          x: i32, y: i32, width: i32, height: i32) {
+        if !self.validate_framebuffer_complete() {
+            return;
+        }
+
         // NB: We use a dummy (valid) format and border in order to reuse the
         // common validations, but this should have its own validator.
         let validator = CommonTexImage2DValidator::new(self, target, level,
@@ -930,6 +1031,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
     fn Clear(&self, mask: u32) {
+        if !self.validate_framebuffer_complete() {
+            return;
+        }
+
         self.ipc_renderer.send(CanvasMsg::WebGL(WebGLCommand::Clear(mask))).unwrap();
         self.mark_as_dirty();
     }
@@ -1022,27 +1127,19 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
     fn Enable(&self, cap: u32) {
-        match cap {
-            constants::BLEND | constants::CULL_FACE | constants::DEPTH_TEST | constants::DITHER |
-            constants::POLYGON_OFFSET_FILL | constants::SAMPLE_ALPHA_TO_COVERAGE | constants::SAMPLE_COVERAGE |
-            constants::SAMPLE_COVERAGE_INVERT | constants::SCISSOR_TEST =>
-                self.ipc_renderer
-                    .send(CanvasMsg::WebGL(WebGLCommand::Enable(cap)))
-                    .unwrap(),
-            _ => self.webgl_error(InvalidEnum),
+        if self.validate_feature_enum(cap) {
+            self.ipc_renderer
+                .send(CanvasMsg::WebGL(WebGLCommand::Enable(cap)))
+                .unwrap();
         }
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
     fn Disable(&self, cap: u32) {
-        match cap {
-            constants::BLEND | constants::CULL_FACE | constants::DEPTH_TEST | constants::DITHER |
-            constants::POLYGON_OFFSET_FILL | constants::SAMPLE_ALPHA_TO_COVERAGE | constants::SAMPLE_COVERAGE |
-            constants::SAMPLE_COVERAGE_INVERT | constants::SCISSOR_TEST =>
-                self.ipc_renderer
-                    .send(CanvasMsg::WebGL(WebGLCommand::Disable(cap)))
-                    .unwrap(),
-            _ => self.webgl_error(InvalidEnum),
+        if self.validate_feature_enum(cap) {
+            self.ipc_renderer
+                .send(CanvasMsg::WebGL(WebGLCommand::Disable(cap)))
+                .unwrap()
         }
     }
 
@@ -1095,6 +1192,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
     fn DeleteBuffer(&self, buffer: Option<&WebGLBuffer>) {
         if let Some(buffer) = buffer {
+            handle_object_deletion!(self.bound_buffer_array, buffer);
+            handle_object_deletion!(self.bound_buffer_element_array, buffer);
             buffer.delete()
         }
     }
@@ -1102,11 +1201,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
     fn DeleteFramebuffer(&self, framebuffer: Option<&WebGLFramebuffer>) {
         if let Some(framebuffer) = framebuffer {
-            if let Some(bound_fb) = self.bound_framebuffer.get() {
-                if bound_fb.id() == framebuffer.id() {
-                    self.bound_framebuffer.set(None);
-                }
-            }
+            handle_object_deletion!(self.bound_framebuffer, framebuffer);
             framebuffer.delete()
         }
     }
@@ -1114,6 +1209,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
     fn DeleteRenderbuffer(&self, renderbuffer: Option<&WebGLRenderbuffer>) {
         if let Some(renderbuffer) = renderbuffer {
+            handle_object_deletion!(self.bound_renderbuffer, renderbuffer);
             renderbuffer.delete()
         }
     }
@@ -1121,6 +1217,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn DeleteTexture(&self, texture: Option<&WebGLTexture>) {
         if let Some(texture) = texture {
+            handle_object_deletion!(self.bound_texture_2d, texture);
+            handle_object_deletion!(self.bound_texture_cube_map, texture);
             texture.delete()
         }
     }
@@ -1128,6 +1226,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
     fn DeleteProgram(&self, program: Option<&WebGLProgram>) {
         if let Some(program) = program {
+            handle_object_deletion!(self.current_program, program);
             program.delete()
         }
     }
@@ -1154,6 +1253,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                     return self.webgl_error(InvalidValue);
                 }
 
+                if !self.validate_framebuffer_complete() {
+                    return;
+                }
+
                 self.ipc_renderer
                     .send(CanvasMsg::WebGL(WebGLCommand::DrawArrays(mode, first, count)))
                     .unwrap();
@@ -1165,10 +1268,12 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
     fn DrawElements(&self, mode: u32, count: i32, type_: u32, offset: i64) {
+        // From the GLES 2.0.25 spec, page 21:
+        //
+        //     "type must be one of UNSIGNED_BYTE or UNSIGNED_SHORT"
         let type_size = match type_ {
-            constants::BYTE | constants::UNSIGNED_BYTE => 1,
-            constants::SHORT | constants::UNSIGNED_SHORT => 2,
-            constants::INT | constants::UNSIGNED_INT | constants::FLOAT => 4,
+            constants::UNSIGNED_BYTE => 1,
+            constants::UNSIGNED_SHORT => 2,
             _ => return self.webgl_error(InvalidEnum),
         };
 
@@ -1186,6 +1291,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
         if self.current_program.get().is_none() || self.bound_buffer_element_array.get().is_none() {
             return self.webgl_error(InvalidOperation);
+        }
+
+        if !self.validate_framebuffer_complete() {
+            return;
         }
 
         match mode {
@@ -1351,9 +1460,28 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         buffer.map_or(false, |buf| buf.target().is_some() && !buf.is_deleted())
     }
 
+    // TODO: We could write this without IPC, recording the calls to `enable` and `disable`.
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
+    fn IsEnabled(&self, cap: u32) -> bool {
+        if self.validate_feature_enum(cap) {
+            let (sender, receiver) = ipc::channel().unwrap();
+            self.ipc_renderer
+                .send(CanvasMsg::WebGL(WebGLCommand::IsEnabled(cap, sender)))
+                .unwrap();
+            return receiver.recv().unwrap();
+        }
+
+        false
+    }
+
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
     fn IsFramebuffer(&self, frame_buffer: Option<&WebGLFramebuffer>) -> bool {
         frame_buffer.map_or(false, |buf| buf.target().is_some() && !buf.is_deleted())
+    }
+
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
+    fn IsProgram(&self, program: Option<&WebGLProgram>) -> bool {
+        program.map_or(false, |p| !p.is_deleted())
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
@@ -1451,6 +1579,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             None => return self.webgl_error(InvalidValue),
         };
 
+        if !self.validate_framebuffer_complete() {
+            return;
+        }
+
         match unsafe { JS_GetArrayBufferViewType(pixels) } {
             Type::Uint8 => (),
             _ => return self.webgl_error(InvalidOperation)
@@ -1479,6 +1611,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.4
     fn Scissor(&self, x: i32, y: i32, width: i32, height: i32) {
+        if width < 0 || height < 0 {
+            return self.webgl_error(InvalidValue)
+        }
+
         self.ipc_renderer
             .send(CanvasMsg::WebGL(WebGLCommand::Scissor(x, y, width, height)))
             .unwrap()
@@ -1891,6 +2027,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.4
     fn Viewport(&self, x: i32, y: i32, width: i32, height: i32) {
+        if width < 0 || height < 0 {
+            return self.webgl_error(InvalidValue)
+        }
+
         self.ipc_renderer
             .send(CanvasMsg::WebGL(WebGLCommand::Viewport(x, y, width, height)))
             .unwrap()

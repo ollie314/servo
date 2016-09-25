@@ -2,20 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use devtools_traits::TimelineMarkerType;
 use devtools_traits::{AutoMargins, CONSOLE_API, CachedConsoleMessage, CachedConsoleMessageTypes};
 use devtools_traits::{ComputedNodeLayout, ConsoleAPI, PageError, ScriptToDevtoolsControlMsg};
 use devtools_traits::{EvaluateJSReply, Modification, NodeInfo, PAGE_ERROR, TimelineMarker};
+use devtools_traits::TimelineMarkerType;
 use dom::bindings::codegen::Bindings::CSSStyleDeclarationBinding::CSSStyleDeclarationMethods;
 use dom::bindings::codegen::Bindings::DOMRectBinding::DOMRectMethods;
 use dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use dom::bindings::codegen::Bindings::LocationBinding::LocationMethods;
 use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use dom::bindings::conversions::{FromJSValConvertible, jsstring_to_str};
+use dom::bindings::conversions::{ConversionResult, FromJSValConvertible, jsstring_to_str};
 use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::Castable;
 use dom::bindings::js::Root;
+use dom::bindings::reflector::Reflectable;
 use dom::bindings::str::DOMString;
 use dom::browsingcontext::BrowsingContext;
 use dom::element::Element;
@@ -27,8 +28,9 @@ use js::jsval::UndefinedValue;
 use msg::constellation_msg::PipelineId;
 use std::ffi::CStr;
 use std::str;
-use style::properties::longhands::{margin_top, margin_right, margin_bottom, margin_left};
+use style::properties::longhands::{margin_bottom, margin_left, margin_right, margin_top};
 use uuid::Uuid;
+
 
 #[allow(unsafe_code)]
 pub fn handle_evaluate_js(global: &GlobalRef, eval: String, reply: IpcSender<EvaluateJSReply>) {
@@ -45,8 +47,11 @@ pub fn handle_evaluate_js(global: &GlobalRef, eval: String, reply: IpcSender<Eva
         } else if rval.is_boolean() {
             EvaluateJSReply::BooleanValue(rval.to_boolean())
         } else if rval.is_double() || rval.is_int32() {
-            EvaluateJSReply::NumberValue(FromJSValConvertible::from_jsval(cx, rval.handle(), ())
-                                             .unwrap())
+            EvaluateJSReply::NumberValue(
+                match FromJSValConvertible::from_jsval(cx, rval.handle(), ()) {
+                    Ok(ConversionResult::Success(v)) => v,
+                    _ => unreachable!(),
+                })
         } else if rval.is_string() {
             EvaluateJSReply::StringValue(String::from(jsstring_to_str(cx, rval.to_string())))
         } else if rval.is_null() {

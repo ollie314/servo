@@ -56,8 +56,10 @@ extern crate log;
 #[allow(unused_extern_crates)]
 #[macro_use]
 extern crate matches;
+extern crate num_integer;
 extern crate num_traits;
 extern crate ordered_float;
+extern crate quickersort;
 extern crate rand;
 extern crate rustc_serialize;
 extern crate selectors;
@@ -79,6 +81,7 @@ pub mod context;
 pub mod custom_properties;
 pub mod data;
 pub mod dom;
+pub mod domrefcell;
 pub mod element_state;
 pub mod error_reporting;
 pub mod font_face;
@@ -100,6 +103,7 @@ pub mod sequential;
 pub mod sink;
 pub mod str;
 pub mod stylesheets;
+pub mod thread_state;
 mod tid;
 pub mod timer;
 pub mod traversal;

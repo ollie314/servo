@@ -7,11 +7,12 @@
 use dom::bindings::error::{Error, Fallible, report_pending_exception};
 use dom::bindings::global::global_root_from_object;
 use dom::bindings::reflector::Reflectable;
-use js::jsapi::GetGlobalForObjectCrossCompartment;
-use js::jsapi::JS_GetProperty;
 use js::jsapi::{Heap, MutableHandleObject, RootedObject};
 use js::jsapi::{IsCallable, JSContext, JSObject, JS_WrapObject};
 use js::jsapi::{JSCompartment, JS_EnterCompartment, JS_LeaveCompartment};
+use js::jsapi::GetGlobalForObjectCrossCompartment;
+use js::jsapi::JSAutoCompartment;
+use js::jsapi::JS_GetProperty;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::RootedGuard;
 use std::default::Default;
@@ -189,7 +190,8 @@ impl<'a> Drop for CallSetup<'a> {
         unsafe {
             JS_LeaveCompartment(self.cx, self.old_compartment);
             if self.handling == ExceptionHandling::Report {
-                report_pending_exception(self.cx, *self.exception_compartment);
+                let _ac = JSAutoCompartment::new(self.cx, *self.exception_compartment);
+                report_pending_exception(self.cx, true);
             }
         }
     }

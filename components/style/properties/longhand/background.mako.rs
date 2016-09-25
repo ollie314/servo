@@ -10,7 +10,7 @@ ${helpers.predefined_type("background-color", "CSSColor",
     "::cssparser::Color::RGBA(::cssparser::RGBA { red: 0., green: 0., blue: 0., alpha: 0. }) /* transparent */",
     animatable=True)}
 
-<%helpers:vector_longhand gecko_only="True" name="background-image" animatable="False">
+<%helpers:vector_longhand name="background-image" animatable="False">
     use cssparser::ToCss;
     use std::fmt;
     use values::specified::Image;
@@ -28,9 +28,7 @@ ${helpers.predefined_type("background-color", "CSSColor",
         fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
             match self.0 {
                 None => dest.write_str("none"),
-                Some(computed::Image::Url(ref url, ref _extra_data)) => url.to_css(dest),
-                Some(computed::Image::LinearGradient(ref gradient)) =>
-                    gradient.to_css(dest)
+                Some(ref image) => image.to_css(dest),
             }
         }
     }
@@ -54,6 +52,10 @@ ${helpers.predefined_type("background-color", "CSSColor",
     pub fn get_initial_value() -> computed_value::T {
         computed_value::T(None)
     }
+    #[inline]
+    pub fn get_initial_specified_value() -> SpecifiedValue {
+        SpecifiedValue(None)
+    }
     pub fn parse(context: &ParserContext, input: &mut Parser) -> Result<SpecifiedValue, ()> {
         if input.try(|input| input.expect_ident_matching("none")).is_ok() {
             Ok(SpecifiedValue(None))
@@ -72,10 +74,19 @@ ${helpers.predefined_type("background-color", "CSSColor",
                     computed_value::T(Some(image.to_computed_value(context))),
             }
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            match *computed {
+                computed_value::T(None) => SpecifiedValue(None),
+                computed_value::T(Some(ref image)) =>
+                    SpecifiedValue(Some(ToComputedValue::from_computed_value(image))),
+            }
+        }
     }
 </%helpers:vector_longhand>
 
-<%helpers:longhand name="background-position" animatable="True">
+<%helpers:vector_longhand name="background-position" animatable="True">
         use cssparser::ToCss;
         use std::fmt;
         use values::LocalToCss;
@@ -84,75 +95,59 @@ ${helpers.predefined_type("background-color", "CSSColor",
 
         pub mod computed_value {
             use values::computed::position::Position;
+            use properties::animated_properties::{Interpolate, RepeatableListInterpolate};
 
-            #[derive(PartialEq, Copy, Clone, Debug)]
-            #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-            pub struct T(pub Position);
+            pub type T = Position;
         }
 
-        impl HasViewportPercentage for SpecifiedValue {
-            fn has_viewport_percentage(&self) -> bool {
-                self.0.has_viewport_percentage()
-            }
-        }
-
-        #[derive(Debug, Clone, PartialEq, Copy)]
-        #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-        pub struct SpecifiedValue(pub Position);
-
-        impl ToCss for SpecifiedValue {
-            fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
-                self.0.to_css(dest)
-            }
-        }
-
-        impl ToCss for computed_value::T {
-            fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
-                self.0.to_css(dest)
-            }
-        }
-
-        impl ToComputedValue for SpecifiedValue {
-            type ComputedValue = computed_value::T;
-
-            #[inline]
-            fn to_computed_value(&self, context: &Context) -> computed_value::T {
-                computed_value::T(self.0.to_computed_value(context))
-            }
-        }
+        pub type SpecifiedValue = Position;
 
         #[inline]
         pub fn get_initial_value() -> computed_value::T {
             use values::computed::position::Position;
-            computed_value::T(Position {
+            Position {
                 horizontal: computed::LengthOrPercentage::Percentage(0.0),
                 vertical: computed::LengthOrPercentage::Percentage(0.0),
-            })
+            }
+        }
+        #[inline]
+        pub fn get_initial_specified_value() -> SpecifiedValue {
+            use values::specified::Percentage;
+            Position {
+                horiz_keyword: None,
+                horiz_position: Some(specified::LengthOrPercentage::Percentage(Percentage(0.0))),
+                vert_keyword: None,
+                vert_position: Some(specified::LengthOrPercentage::Percentage(Percentage(0.0))),
+            }
         }
 
         pub fn parse(_context: &ParserContext, input: &mut Parser)
                      -> Result<SpecifiedValue, ()> {
-            Ok(SpecifiedValue(try!(Position::parse(input))))
+            Ok(try!(Position::parse(input)))
         }
-</%helpers:longhand>
+</%helpers:vector_longhand>
 
 ${helpers.single_keyword("background-repeat",
-                         "repeat repeat-x repeat-y no-repeat",
+                         "repeat repeat-x repeat-y space round no-repeat",
+                         vector=True,
                          animatable=False)}
 
 ${helpers.single_keyword("background-attachment",
                          "scroll fixed" + (" local" if product == "gecko" else ""),
+                         vector=True,
                          animatable=False)}
 
 ${helpers.single_keyword("background-clip",
                          "border-box padding-box content-box",
+                         vector=True,
                          animatable=False)}
 
 ${helpers.single_keyword("background-origin",
                          "padding-box border-box content-box",
+                         vector=True,
                          animatable=False)}
 
-<%helpers:longhand name="background-size" animatable="True">
+<%helpers:vector_longhand name="background-size" animatable="True">
     use cssparser::{ToCss, Token};
     use std::ascii::AsciiExt;
     use std::fmt;
@@ -160,6 +155,7 @@ ${helpers.single_keyword("background-origin",
 
     pub mod computed_value {
         use values::computed::LengthOrPercentageOrAuto;
+        use properties::animated_properties::{Interpolate, RepeatableListInterpolate};
 
         #[derive(PartialEq, Clone, Debug)]
         #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
@@ -175,6 +171,23 @@ ${helpers.single_keyword("background-origin",
             Cover,
             Contain,
         }
+
+        impl RepeatableListInterpolate for T {}
+
+        impl Interpolate for T {
+            fn interpolate(&self, other: &Self, time: f64) -> Result<Self, ()> {
+                use properties::longhands::background_size::single_value::computed_value::ExplicitSize;
+                match (self, other) {
+                    (&T::Explicit(ref me), &T::Explicit(ref other)) => {
+                        Ok(T::Explicit(ExplicitSize {
+                            width: try!(me.width.interpolate(&other.width, time)),
+                            height: try!(me.height.interpolate(&other.height, time)),
+                        }))
+                    }
+                    _ => Err(()),
+                }
+            }
+        }
     }
 
     impl ToCss for computed_value::T {
@@ -187,7 +200,7 @@ ${helpers.single_keyword("background-origin",
         }
     }
 
-    impl HasViewportPercentage for SpecifiedExplicitSize {
+    impl HasViewportPercentage for ExplicitSize {
         fn has_viewport_percentage(&self) -> bool {
             return self.width.has_viewport_percentage() || self.height.has_viewport_percentage();
         }
@@ -195,12 +208,12 @@ ${helpers.single_keyword("background-origin",
 
     #[derive(Clone, PartialEq, Debug)]
     #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-    pub struct SpecifiedExplicitSize {
+    pub struct ExplicitSize {
         pub width: specified::LengthOrPercentageOrAuto,
         pub height: specified::LengthOrPercentageOrAuto,
     }
 
-    impl ToCss for SpecifiedExplicitSize {
+    impl ToCss for ExplicitSize {
         fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
             try!(self.width.to_css(dest));
             try!(dest.write_str(" "));
@@ -228,7 +241,7 @@ ${helpers.single_keyword("background-origin",
     #[derive(Clone, PartialEq, Debug)]
     #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
     pub enum SpecifiedValue {
-        Explicit(SpecifiedExplicitSize),
+        Explicit(ExplicitSize),
         Cover,
         Contain,
     }
@@ -259,6 +272,19 @@ ${helpers.single_keyword("background-origin",
                 SpecifiedValue::Contain => computed_value::T::Contain,
             }
         }
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            match *computed {
+                computed_value::T::Explicit(ref size) => {
+                    SpecifiedValue::Explicit(ExplicitSize {
+                        width: ToComputedValue::from_computed_value(&size.width),
+                        height: ToComputedValue::from_computed_value(&size.height),
+                    })
+                }
+                computed_value::T::Cover => SpecifiedValue::Cover,
+                computed_value::T::Contain => SpecifiedValue::Contain,
+            }
+        }
     }
 
     #[inline]
@@ -266,6 +292,13 @@ ${helpers.single_keyword("background-origin",
         computed_value::T::Explicit(computed_value::ExplicitSize {
             width: computed::LengthOrPercentageOrAuto::Auto,
             height: computed::LengthOrPercentageOrAuto::Auto,
+        })
+    }
+    #[inline]
+    pub fn get_initial_specified_value() -> SpecifiedValue {
+        SpecifiedValue::Explicit(ExplicitSize {
+            width: specified::LengthOrPercentageOrAuto::Auto,
+            height: specified::LengthOrPercentageOrAuto::Auto,
         })
     }
 
@@ -300,9 +333,9 @@ ${helpers.single_keyword("background-origin",
             height = try!(specified::LengthOrPercentageOrAuto::parse(input));
         }
 
-        Ok(SpecifiedValue::Explicit(SpecifiedExplicitSize {
+        Ok(SpecifiedValue::Explicit(ExplicitSize {
             width: width,
             height: height,
         }))
     }
-</%helpers:longhand>
+</%helpers:vector_longhand>

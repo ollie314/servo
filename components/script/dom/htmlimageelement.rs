@@ -86,14 +86,14 @@ impl Runnable for ImageResponseHandlerRunnable {
         // Update the image field
         let element = self.element.root();
         let element_ref = element.r();
-        let (image, metadata, trigger_image_load) = match self.image {
+        let (image, metadata, trigger_image_load, trigger_image_error) = match self.image {
             ImageResponse::Loaded(image) | ImageResponse::PlaceholderLoaded(image) => {
-                (Some(image.clone()), Some(ImageMetadata { height: image.height, width: image.width } ), true)
+                (Some(image.clone()), Some(ImageMetadata { height: image.height, width: image.width } ), true, false)
             }
             ImageResponse::MetadataLoaded(meta) => {
-                (None, Some(meta), false)
+                (None, Some(meta), false, false)
             }
-            ImageResponse::None => (None, None, true)
+            ImageResponse::None => (None, None, false, true)
         };
         element_ref.current_request.borrow_mut().image = image;
         element_ref.current_request.borrow_mut().metadata = metadata;
@@ -105,6 +105,11 @@ impl Runnable for ImageResponseHandlerRunnable {
         // Fire image.onload
         if trigger_image_load {
             element.upcast::<EventTarget>().fire_simple_event("load");
+        }
+
+        // Fire image.onerror
+        if trigger_image_error {
+            element.upcast::<EventTarget>().fire_simple_event("error");
         }
 
         // Trigger reflow
@@ -189,9 +194,9 @@ impl HTMLImageElement {
             }
         }
     }
-    fn new_inherited(localName: Atom, prefix: Option<DOMString>, document: &Document) -> HTMLImageElement {
+    fn new_inherited(local_name: Atom, prefix: Option<DOMString>, document: &Document) -> HTMLImageElement {
         HTMLImageElement {
-            htmlelement: HTMLElement::new_inherited(localName, prefix, document),
+            htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             current_request: DOMRefCell::new(ImageRequest {
                 state: State::Unavailable,
                 parsed_url: None,
@@ -210,10 +215,10 @@ impl HTMLImageElement {
     }
 
     #[allow(unrooted_must_root)]
-    pub fn new(localName: Atom,
+    pub fn new(local_name: Atom,
                prefix: Option<DOMString>,
                document: &Document) -> Root<HTMLImageElement> {
-        Node::reflect_node(box HTMLImageElement::new_inherited(localName, prefix, document),
+        Node::reflect_node(box HTMLImageElement::new_inherited(local_name, prefix, document),
                            document,
                            HTMLImageElementBinding::Wrap)
     }

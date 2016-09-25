@@ -6,17 +6,17 @@
 
 use app_units::Au;
 use block::AbsoluteAssignBSizesTraversal;
-use context::LayoutContext;
-use display_list_builder::DisplayListBuildState;
+use context::{LayoutContext, SharedLayoutContext};
 use display_list_builder::{FragmentDisplayListBuilding, InlineFlowDisplayListBuilding};
+use display_list_builder::DisplayListBuildState;
 use euclid::{Point2D, Size2D};
 use floats::{FloatKind, Floats, PlacementInfo};
-use flow::OpaqueFlow;
-use flow::{CONTAINS_TEXT_OR_REPLACED_FRAGMENTS, EarlyAbsolutePositionInfo, MutableFlowUtils};
 use flow::{self, BaseFlow, Flow, FlowClass, ForceNonfloatedFlag, IS_ABSOLUTELY_POSITIONED};
+use flow::{CONTAINS_TEXT_OR_REPLACED_FRAGMENTS, EarlyAbsolutePositionInfo, MutableFlowUtils};
+use flow::OpaqueFlow;
 use flow_ref;
-use fragment::SpecificFragmentInfo;
 use fragment::{CoordinateSystem, Fragment, FragmentBorderBoxIterator, Overflow};
+use fragment::SpecificFragmentInfo;
 use gfx::display_list::{OpaqueNode, StackingContext};
 use gfx::font::FontMetrics;
 use gfx::font_context::FontContext;
@@ -28,10 +28,10 @@ use range::{Range, RangeIndex};
 use script_layout_interface::restyle_damage::{BUBBLE_ISIZES, REFLOW};
 use script_layout_interface::restyle_damage::{REFLOW_OUT_OF_FLOW, RESOLVE_GENERATED_CONTENT};
 use script_layout_interface::wrapper_traits::PseudoElementType;
+use std::{fmt, i32, isize, mem};
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::{fmt, i32, isize, mem};
 use style::arc_ptr_eq;
 use style::computed_values::{display, overflow_x, position, text_align, text_justify};
 use style::computed_values::{text_overflow, vertical_align, white_space};
@@ -1532,7 +1532,7 @@ impl Flow for InlineFlow {
         }
     }
 
-    fn compute_absolute_position(&mut self, _: &LayoutContext) {
+    fn compute_absolute_position(&mut self, _: &SharedLayoutContext) {
         // First, gather up the positions of all the containing blocks (if any).
         //
         // FIXME(pcwalton): This will get the absolute containing blocks inside `...` wrong in the

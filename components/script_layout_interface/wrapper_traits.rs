@@ -10,12 +10,13 @@ use gfx_traits::{ByteIndex, LayerId, LayerType};
 use msg::constellation_msg::PipelineId;
 use range::Range;
 use restyle_damage::RestyleDamage;
+use std::fmt::Debug;
 use std::sync::Arc;
 use string_cache::{Atom, Namespace};
 use style::computed_values::display;
 use style::context::SharedStyleContext;
+use style::dom::{LayoutIterator, NodeInfo, PresentationalHintsSynthetizer, TNode};
 use style::dom::OpaqueNode;
-use style::dom::{PresentationalHintsSynthetizer, TNode};
 use style::properties::ServoComputedValues;
 use style::refcell::{Ref, RefCell};
 use style::selector_impl::{PseudoElement, PseudoElementCascadeType, ServoSelectorImpl};
@@ -79,11 +80,64 @@ pub trait LayoutNode: TNode {
 
     fn init_style_and_layout_data(&self, data: OpaqueStyleAndLayoutData);
     fn get_style_and_layout_data(&self) -> Option<OpaqueStyleAndLayoutData>;
+
+    fn rev_children(self) -> LayoutIterator<ReverseChildrenIterator<Self>> {
+        LayoutIterator(ReverseChildrenIterator {
+            current: self.last_child(),
+        })
+    }
+
+    fn traverse_preorder(self) -> TreeIterator<Self> {
+        TreeIterator::new(self)
+    }
 }
+
+pub struct ReverseChildrenIterator<ConcreteNode> where ConcreteNode: TNode {
+    current: Option<ConcreteNode>,
+}
+
+impl<ConcreteNode> Iterator for ReverseChildrenIterator<ConcreteNode>
+                            where ConcreteNode: TNode {
+    type Item = ConcreteNode;
+    fn next(&mut self) -> Option<ConcreteNode> {
+        let node = self.current;
+        self.current = node.and_then(|node| node.prev_sibling());
+        node
+    }
+}
+
+pub struct TreeIterator<ConcreteNode> where ConcreteNode: TNode {
+    stack: Vec<ConcreteNode>,
+}
+
+impl<ConcreteNode> TreeIterator<ConcreteNode> where ConcreteNode: LayoutNode {
+    fn new(root: ConcreteNode) -> TreeIterator<ConcreteNode> {
+        let mut stack = vec![];
+        stack.push(root);
+        TreeIterator {
+            stack: stack,
+        }
+    }
+
+    pub fn next_skipping_children(&mut self) -> Option<ConcreteNode> {
+        self.stack.pop()
+    }
+}
+
+impl<ConcreteNode> Iterator for TreeIterator<ConcreteNode>
+                            where ConcreteNode: LayoutNode {
+    type Item = ConcreteNode;
+    fn next(&mut self) -> Option<ConcreteNode> {
+        let ret = self.stack.pop();
+        ret.map(|node| self.stack.extend(node.rev_children()));
+        ret
+    }
+}
+
 
 /// A thread-safe version of `LayoutNode`, used during flow construction. This type of layout
 /// node does not allow any parents or siblings of nodes to be accessed, to avoid races.
-pub trait ThreadSafeLayoutNode: Clone + Copy + Sized + PartialEq {
+pub trait ThreadSafeLayoutNode: Clone + Copy + NodeInfo + PartialEq + Sized {
     type ConcreteThreadSafeLayoutElement:
         ThreadSafeLayoutElement<ConcreteThreadSafeLayoutNode = Self>
         + ::selectors::Element<Impl=ServoSelectorImpl>;
@@ -115,10 +169,7 @@ pub trait ThreadSafeLayoutNode: Clone + Copy + Sized + PartialEq {
     fn debug_id(self) -> usize;
 
     /// Returns an iterator over this node's children.
-    fn children(&self) -> Self::ChildrenIterator;
-
-    #[inline]
-    fn is_element(&self) -> bool { if let Some(LayoutNodeType::Element(_)) = self.type_id() { true } else { false } }
+    fn children(&self) -> LayoutIterator<Self::ChildrenIterator>;
 
     /// If this is an element, accesses the element data. Fails if this is not an element node.
     #[inline]
@@ -350,7 +401,7 @@ pub trait DangerousThreadSafeLayoutNode: ThreadSafeLayoutNode {
     unsafe fn dangerous_next_sibling(&self) -> Option<Self>;
 }
 
-pub trait ThreadSafeLayoutElement: Clone + Copy + Sized +
+pub trait ThreadSafeLayoutElement: Clone + Copy + Sized + Debug +
                                    ::selectors::Element<Impl=ServoSelectorImpl> +
                                    PresentationalHintsSynthetizer {
     type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<ConcreteThreadSafeLayoutElement = Self>;

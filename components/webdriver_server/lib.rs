@@ -15,6 +15,8 @@ extern crate euclid;
 extern crate hyper;
 extern crate image;
 extern crate ipc_channel;
+#[macro_use]
+extern crate log;
 extern crate msg;
 extern crate regex;
 extern crate rustc_serialize;
@@ -32,13 +34,13 @@ use image::{DynamicImage, ImageFormat, RgbImage};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use keys::keycodes_to_keys;
 use msg::constellation_msg::{FrameId, LoadData, PipelineId};
-use msg::constellation_msg::{TraversalDirection, PixelFormat};
+use msg::constellation_msg::{PixelFormat, TraversalDirection};
 use regex::Captures;
 use rustc_serialize::base64::{CharacterSet, Config, Newline, ToBase64};
 use rustc_serialize::json::{Json, ToJson};
+use script_traits::{ConstellationMsg, WebDriverCommandMsg};
 use script_traits::webdriver_msg::{LoadStatus, WebDriverCookieError, WebDriverFrameId};
 use script_traits::webdriver_msg::{WebDriverJSError, WebDriverJSResult, WebDriverScriptCommand};
-use script_traits::{ConstellationMsg, WebDriverCommandMsg};
 use std::borrow::ToOwned;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -49,11 +51,11 @@ use url::Url;
 use util::prefs::{PREFS, PrefValue};
 use util::thread::spawn_named;
 use uuid::Uuid;
-use webdriver::command::WindowSizeParameters;
 use webdriver::command::{AddCookieParameters, GetParameters, JavascriptCommandParameters};
 use webdriver::command::{LocatorParameters, Parameters};
 use webdriver::command::{SendKeysParameters, SwitchToFrameParameters, TimeoutsParameters};
 use webdriver::command::{WebDriverCommand, WebDriverExtensionCommand, WebDriverMessage};
+use webdriver::command::WindowSizeParameters;
 use webdriver::common::{Date, LocatorStrategy, Nullable, WebElement};
 use webdriver::error::{ErrorStatus, WebDriverError, WebDriverResult};
 use webdriver::httpapi::WebDriverExtensionRoute;
@@ -78,10 +80,6 @@ fn cookie_msg_to_cookie(cookie: cookie_rs::Cookie) -> Cookie {
             Some(time) => Nullable::Value(Date::new(time.to_timespec().sec as u64)),
             None => Nullable::Null
         },
-        maxAge: match cookie.max_age {
-            Some(time) => Nullable::Value(Date::new(time)),
-            None => Nullable::Null
-        },
         secure: cookie.secure,
         httpOnly: cookie.httponly,
     }
@@ -91,8 +89,10 @@ pub fn start_server(port: u16, constellation_chan: Sender<ConstellationMsg>) {
     let handler = Handler::new(constellation_chan);
     spawn_named("WebdriverHttpServer".to_owned(), move || {
         let address = SocketAddrV4::new("0.0.0.0".parse().unwrap(), port);
-        server::start(SocketAddr::V4(address), handler,
-                      extension_routes());
+        match server::start(SocketAddr::V4(address), handler, extension_routes()) {
+            Ok(listening) => info!("WebDriver server listening on {}", listening.socket),
+            Err(_) => panic!("Unable to start WebDriver HTTPD server"),
+         }
     });
 }
 
@@ -251,7 +251,7 @@ impl Handler {
         }
     }
 
-    fn pipeline(&self, frame_id: Option<FrameId>) -> WebDriverResult<PipelineId> {
+    fn pipeline_id(&self, frame_id: Option<FrameId>) -> WebDriverResult<PipelineId> {
         let interval = 20;
         let iterations = 30_000 / interval;
         let (sender, receiver) = ipc::channel().unwrap();
@@ -271,11 +271,11 @@ impl Handler {
     }
 
     fn root_pipeline(&self) -> WebDriverResult<PipelineId> {
-        self.pipeline(None)
+        self.pipeline_id(None)
     }
 
     fn frame_pipeline(&self) -> WebDriverResult<PipelineId> {
-        self.pipeline(self.session.as_ref().and_then(|session| session.frame_id))
+        self.pipeline_id(self.session.as_ref().and_then(|session| session.frame_id))
     }
 
     fn session(&self) -> WebDriverResult<&WebDriverSession> {
@@ -847,18 +847,18 @@ impl Handler {
 impl WebDriverHandler<ServoExtensionRoute> for Handler {
     fn handle_command(&mut self,
                       _session: &Option<Session>,
-                      msg: &WebDriverMessage<ServoExtensionRoute>) -> WebDriverResult<WebDriverResponse> {
+                      msg: WebDriverMessage<ServoExtensionRoute>) -> WebDriverResult<WebDriverResponse> {
         // Unless we are trying to create a new session, we need to ensure that a
         // session has previously been created
         match msg.command {
-            WebDriverCommand::NewSession => {},
+            WebDriverCommand::NewSession(_) => {},
             _ => {
                 try!(self.session());
             }
         }
 
         match msg.command {
-            WebDriverCommand::NewSession => self.handle_new_session(),
+            WebDriverCommand::NewSession(_) => self.handle_new_session(),
             WebDriverCommand::DeleteSession => self.handle_delete_session(),
             WebDriverCommand::AddCookie(ref parameters) => self.handle_add_cookie(parameters),
             WebDriverCommand::Get(ref parameters) => self.handle_get(parameters),

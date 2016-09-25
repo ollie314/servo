@@ -12,7 +12,7 @@ path = "lib.rs"
 [dependencies]
 app_units = "0.3"
 azure = {git = "https://github.com/servo/rust-azure", features = ["plugins"]}
-euclid = "0.9"
+euclid = "0.10.1"
 fnv = "1.0"
 gfx = {path = "../gfx"}
 gfx_traits = {path = "../gfx_traits"}
@@ -21,6 +21,7 @@ heapsize_plugin = "0.1.2"
 ipc-channel = "0.5"
 layout = {path = "../layout"}
 layout_traits = {path = "../layout_traits"}
+lazy_static = "0.2"
 log = "0.3.5"
 msg = {path = "../msg"}
 net_traits = {path = "../net_traits"}

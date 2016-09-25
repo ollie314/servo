@@ -9,14 +9,14 @@ use compositor_layer::{CompositorData, CompositorLayer, RcCompositorLayer, Wants
 use compositor_thread::{CompositorProxy, CompositorReceiver};
 use compositor_thread::{InitialCompositorState, Msg, RenderListener};
 use delayed_composition::DelayedCompositionTimerProxy;
+use euclid::{Matrix4D, Point2D, Rect, Size2D};
 use euclid::point::TypedPoint2D;
 use euclid::rect::TypedRect;
 use euclid::scale_factor::ScaleFactor;
 use euclid::size::TypedSize2D;
-use euclid::{Matrix4D, Point2D, Rect, Size2D};
-use gfx_traits::print_tree::PrintTree;
 use gfx_traits::{ChromeToPaintMsg, PaintRequest, ScrollPolicy, StackingContextId};
 use gfx_traits::{color, Epoch, FrameTreeId, FragmentType, LayerId, LayerKind, LayerProperties};
+use gfx_traits::print_tree::PrintTree;
 use gleam::gl;
 use gleam::gl::types::{GLint, GLsizei};
 use image::{DynamicImage, ImageFormat, RgbImage};
@@ -33,19 +33,19 @@ use msg::constellation_msg::{LoadData, TraversalDirection, PipelineId};
 use msg::constellation_msg::{PipelineIndex, PipelineNamespaceId, WindowSizeType};
 use profile_traits::mem::{self, ReportKind, Reporter, ReporterRequest};
 use profile_traits::time::{self, ProfilerCategory, profile};
-use script_traits::CompositorEvent::{MouseMoveEvent, MouseButtonEvent, TouchEvent};
 use script_traits::{AnimationState, AnimationTickType, ConstellationControlMsg};
 use script_traits::{ConstellationMsg, LayoutControlMsg, MouseButton, MouseEventType};
 use script_traits::{StackingContextScrollState, TouchpadPressurePhase, TouchEventType};
 use script_traits::{TouchId, WindowSizeData};
-use std::collections::hash_map::Entry::{Occupied, Vacant};
+use script_traits::CompositorEvent::{MouseMoveEvent, MouseButtonEvent, TouchEvent};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fs::File;
 use std::mem as std_mem;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
-use style_traits::viewport::ViewportConstraints;
 use style_traits::{PagePx, ViewportPx};
+use style_traits::viewport::ViewportConstraints;
 use surface_map::SurfaceMap;
 use time::{precise_time_ns, precise_time_s};
 use touch::{TouchHandler, TouchAction};
@@ -467,7 +467,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
             context: None,
             root_pipeline: None,
             pipeline_details: HashMap::new(),
-            scene: Scene::new(TypedRect::new(TypedPoint2D::zero(), window_size.as_f32())),
+            scene: Scene::new(TypedRect::new(TypedPoint2D::zero(), window_size.to_f32())),
             window_size: window_size,
             viewport: None,
             scale_factor: scale_factor,
@@ -898,7 +898,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
         self.scene.root = Some(self.create_root_layer_for_pipeline_and_size(&frame_tree.pipeline,
                                                                             None));
-        self.scene.set_root_layer_size(self.window_size.as_f32());
+        self.scene.set_root_layer_size(self.window_size.to_f32());
 
         self.create_pipeline_details_for_frame_tree(&frame_tree);
 
@@ -1146,7 +1146,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn send_window_size(&self, size_type: WindowSizeType) {
         let dppx = self.page_zoom * self.device_pixels_per_screen_px();
-        let initial_viewport = self.window_size.as_f32() / dppx;
+        let initial_viewport = self.window_size.to_f32() / dppx;
         let visible_viewport = initial_viewport / self.viewport_zoom;
         let msg = ConstellationMsg::WindowSize(WindowSizeData {
             device_pixel_ratio: dppx,
@@ -1383,7 +1383,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
         self.window_size = new_size;
 
-        self.scene.set_root_layer_size(new_size.as_f32());
+        self.scene.set_root_layer_size(new_size.to_f32());
         self.send_window_size(WindowSizeType::Resize);
     }
 
@@ -1627,8 +1627,8 @@ impl<Window: WindowMethods> IOCompositor<Window> {
                     if let Some(combined_event) = last_combined_event {
                         if combined_event.phase != scroll_event.phase {
                             let delta = (combined_event.delta / self.scene.scale).to_untyped();
-                            let cursor = (combined_event.cursor.as_f32() /
-                                          self.scene.scale).to_untyped();
+                            let cursor =
+                                (combined_event.cursor.to_f32() / self.scene.scale).to_untyped();
                             webrender_api.scroll(delta, cursor, combined_event.phase);
                             last_combined_event = None
                         }
@@ -1669,7 +1669,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
                 // TODO(gw): Support zoom (WR issue #28).
                 if let Some(combined_event) = last_combined_event {
                     let delta = (combined_event.delta / self.scene.scale).to_untyped();
-                    let cursor = (combined_event.cursor.as_f32() / self.scene.scale).to_untyped();
+                    let cursor = (combined_event.cursor.to_f32() / self.scene.scale).to_untyped();
                     webrender_api.scroll(delta, cursor, combined_event.phase);
                     self.waiting_for_results_of_scroll = true
                 }
@@ -1678,7 +1678,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
                 for event in std_mem::replace(&mut self.pending_scroll_zoom_events,
                                                      Vec::new()) {
                     let delta = event.delta / self.scene.scale;
-                    let cursor = event.cursor.as_f32() / self.scene.scale;
+                    let cursor = event.cursor.to_f32() / self.scene.scale;
 
                     if let Some(ref mut layer) = self.scene.root {
                         layer.handle_scroll_event(delta, cursor);
@@ -1736,7 +1736,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
         }
 
         let dppx = self.page_zoom * self.device_pixels_per_screen_px();
-        let window_size = self.window_size.as_f32() / dppx * ScaleFactor::new(1.0);
+        let window_size = self.window_size.to_f32() / dppx * ScaleFactor::new(1.0);
         let mut new_visible_rects = HashMap::new();
         if let Some(ref layer) = self.scene.root {
             process_layer(&**layer, &window_size, &mut new_visible_rects)
@@ -1835,7 +1835,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
         // We need to set the size of the root layer again, since the window size
         // has changed in unscaled layer pixels.
-        self.scene.set_root_layer_size(self.window_size.as_f32());
+        self.scene.set_root_layer_size(self.window_size.to_f32());
     }
 
     fn on_zoom_reset_window_event(&mut self) {
@@ -2236,8 +2236,8 @@ impl<Window: WindowMethods> IOCompositor<Window> {
             self.dump_layer_tree();
             // Adjust the layer dimensions as necessary to correspond to the size of the window.
             self.scene.viewport = match self.viewport {
-                Some((point, size)) => TypedRect::new(point.as_f32(), size.as_f32()),
-                None => TypedRect::new(TypedPoint2D::zero(), self.window_size.as_f32()),
+                Some((point, size)) => TypedRect::new(point.to_f32(), size.to_f32()),
+                None => TypedRect::new(TypedPoint2D::zero(), self.window_size.to_f32()),
             };
 
             // Paint the scene.

@@ -10,16 +10,17 @@ use dom::bindings::inheritance::Castable;
 use dom::bindings::js::{JS, Root};
 use dom::bindings::reflector::{Reflector, reflect_dom_object};
 use dom::bindings::str::DOMString;
-use dom::element::{Element, StylePriority};
+use dom::element::Element;
 use dom::node::{Node, NodeDamage, window_from_node};
 use dom::window::Window;
 use std::ascii::AsciiExt;
-use std::cell::Ref;
 use std::slice;
+use std::sync::Arc;
 use string_cache::Atom;
 use style::parser::ParserContextExtraData;
-use style::properties::{PropertyDeclaration, Shorthand};
+use style::properties::{PropertyDeclaration, Shorthand, Importance};
 use style::properties::{is_supported_property, parse_one_declaration, parse_style_attribute};
+use style::refcell::Ref;
 use style::selector_impl::PseudoElement;
 
 // http://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
@@ -92,7 +93,7 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
     fn Length(&self) -> u32 {
         let elem = self.owner.upcast::<Element>();
         let len = match *elem.style_attribute().borrow() {
-            Some(ref declarations) => declarations.normal.len() + declarations.important.len(),
+            Some(ref declarations) => declarations.declarations.len(),
             None => 0,
         };
         len as u32
@@ -100,22 +101,7 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
 
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-item
     fn Item(&self, index: u32) -> DOMString {
-        let index = index as usize;
-        let elem = self.owner.upcast::<Element>();
-        let style_attribute = elem.style_attribute().borrow();
-        let result = style_attribute.as_ref().and_then(|declarations| {
-            if index > declarations.normal.len() {
-                declarations.important
-                            .get(index - declarations.normal.len())
-                            .map(|decl| format!("{:?} !important", decl))
-            } else {
-                declarations.normal
-                            .get(index)
-                            .map(|decl| format!("{:?}", decl))
-            }
-        });
-
-        result.map_or(DOMString::new(), DOMString::from)
+        self.IndexedGetter(index).unwrap_or_default()
     }
 
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-getpropertyvalue
@@ -151,22 +137,23 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
             // Step 2.3
             // Work around closures not being Clone
             #[derive(Clone)]
-            struct Map<'a, 'b: 'a>(slice::Iter<'a, Ref<'b, PropertyDeclaration>>);
+            struct Map<'a, 'b: 'a>(slice::Iter<'a, Ref<'b, (PropertyDeclaration, Importance)>>);
             impl<'a, 'b> Iterator for Map<'a, 'b> {
                 type Item = &'a PropertyDeclaration;
                 fn next(&mut self) -> Option<Self::Item> {
-                    self.0.next().map(|r| &**r)
+                    self.0.next().map(|r| &r.0)
                 }
             }
 
             // TODO: important is hardcoded to false because method does not implement it yet
-            let serialized_value = shorthand.serialize_shorthand_value_to_string(Map(list.iter()), false);
+            let serialized_value = shorthand.serialize_shorthand_value_to_string(
+                Map(list.iter()), Importance::Normal);
             return DOMString::from(serialized_value);
         }
 
         // Step 3 & 4
         match owner.get_inline_style_declaration(&property) {
-            Some(declaration) => DOMString::from(declaration.value()),
+            Some(declaration) => DOMString::from(declaration.0.value()),
             None => DOMString::new(),
         }
     }
@@ -187,8 +174,10 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
             }
         // Step 3
         } else {
-            if self.owner.get_important_inline_style_declaration(&property).is_some() {
-                return DOMString::from("important");
+            if let Some(decl) = self.owner.get_inline_style_declaration(&property) {
+                if decl.1.important() {
+                    return DOMString::from("important");
+                }
             }
         }
 
@@ -222,8 +211,8 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
 
         // Step 5
         let priority = match &*priority {
-            "" => StylePriority::Normal,
-            p if p.eq_ignore_ascii_case("important") => StylePriority::Important,
+            "" => Importance::Normal,
+            p if p.eq_ignore_ascii_case("important") => Importance::Important,
             _ => return Ok(()),
         };
 
@@ -265,8 +254,8 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
 
         // Step 4
         let priority = match &*priority {
-            "" => StylePriority::Normal,
-            p if p.eq_ignore_ascii_case("important") => StylePriority::Important,
+            "" => Importance::Normal,
+            p if p.eq_ignore_ascii_case("important") => Importance::Important,
             _ => return Ok(()),
         };
 
@@ -334,10 +323,19 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
     }
 
     // https://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
-    fn IndexedGetter(&self, index: u32, found: &mut bool) -> DOMString {
-        let rval = self.Item(index);
-        *found = index < self.Length();
-        rval
+    fn IndexedGetter(&self, index: u32) -> Option<DOMString> {
+        let index = index as usize;
+        let elem = self.owner.upcast::<Element>();
+        let style_attribute = elem.style_attribute().borrow();
+        style_attribute.as_ref().and_then(|declarations| {
+            declarations.declarations.get(index)
+        }).map(|&(ref declaration, importance)| {
+            let mut css = declaration.to_css_string();
+            if importance.important() {
+                css += " !important";
+            }
+            DOMString::from(css)
+        })
     }
 
     // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-csstext
@@ -365,10 +363,10 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
         // Step 3
         let decl_block = parse_style_attribute(&value, &window.get_url(), window.css_error_reporter(),
                                                ParserContextExtraData::default());
-        *element.style_attribute().borrow_mut() = if decl_block.normal.is_empty() && decl_block.important.is_empty() {
+        *element.style_attribute().borrow_mut() = if decl_block.declarations.is_empty() {
             None // Step 2
         } else {
-            Some(decl_block)
+            Some(Arc::new(decl_block))
         };
         element.sync_property_with_attrs_style();
         let node = element.upcast::<Node>();

@@ -10,6 +10,7 @@ use dom::bindings::codegen::Bindings::HTMLCanvasElementBinding;
 use dom::bindings::codegen::Bindings::HTMLCanvasElementBinding::HTMLCanvasElementMethods;
 use dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLContextAttributes;
 use dom::bindings::codegen::UnionTypes::CanvasRenderingContext2DOrWebGLRenderingContext;
+use dom::bindings::conversions::ConversionResult;
 use dom::bindings::error::{Error, Fallible};
 use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::Castable;
@@ -27,6 +28,7 @@ use euclid::size::Size2D;
 use image::ColorType;
 use image::png::PNGEncoder;
 use ipc_channel::ipc::{self, IpcSender};
+use js::error::throw_type_error;
 use js::jsapi::{HandleValue, JSContext};
 use offscreen_gl_context::GLContextAttributes;
 use rustc_serialize::base64::{STANDARD, ToBase64};
@@ -54,20 +56,20 @@ pub struct HTMLCanvasElement {
 }
 
 impl HTMLCanvasElement {
-    fn new_inherited(localName: Atom,
+    fn new_inherited(local_name: Atom,
                      prefix: Option<DOMString>,
                      document: &Document) -> HTMLCanvasElement {
         HTMLCanvasElement {
-            htmlelement: HTMLElement::new_inherited(localName, prefix, document),
+            htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             context: DOMRefCell::new(None),
         }
     }
 
     #[allow(unrooted_must_root)]
-    pub fn new(localName: Atom,
+    pub fn new(local_name: Atom,
                prefix: Option<DOMString>,
                document: &Document) -> Root<HTMLCanvasElement> {
-        Node::reflect_node(box HTMLCanvasElement::new_inherited(localName, prefix, document),
+        Node::reflect_node(box HTMLCanvasElement::new_inherited(local_name, prefix, document),
                            document,
                            HTMLCanvasElementBinding::Wrap)
     }
@@ -159,11 +161,17 @@ impl HTMLCanvasElement {
             let size = self.get_size();
 
             let attrs = if let Some(webgl_attributes) = attrs {
-                if let Ok(ref attrs) = unsafe { WebGLContextAttributes::new(cx, webgl_attributes) } {
-                    From::from(attrs)
-                } else {
-                    debug!("Unexpected error on conversion of WebGLContextAttributes");
-                    return None;
+                match unsafe {
+                    WebGLContextAttributes::new(cx, webgl_attributes) } {
+                    Ok(ConversionResult::Success(ref attrs)) => From::from(attrs),
+                    Ok(ConversionResult::Failure(ref error)) => {
+                        unsafe { throw_type_error(cx, &error); }
+                        return None;
+                    }
+                    _ => {
+                        debug!("Unexpected error on conversion of WebGLContextAttributes");
+                        return None;
+                    }
                 }
             } else {
                 GLContextAttributes::default()
@@ -265,11 +273,10 @@ impl HTMLCanvasElementMethods for HTMLCanvasElement {
         // Step 3.
         let raw_data = match *self.context.borrow() {
             Some(CanvasContext::Context2d(ref context)) => {
-                let window = window_from_node(self);
                 let image_data = try!(context.GetImageData(Finite::wrap(0f64), Finite::wrap(0f64),
                                                            Finite::wrap(self.Width() as f64),
                                                            Finite::wrap(self.Height() as f64)));
-                image_data.get_data_array(&GlobalRef::Window(window.r()))
+                image_data.get_data_array()
             }
             None => {
                 // Each pixel is fully-transparent black.

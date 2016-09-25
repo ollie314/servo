@@ -8,7 +8,7 @@
 
 use app_units::{Au, MAX_AU};
 use block::BlockFlow;
-use context::LayoutContext;
+use context::{LayoutContext, SharedLayoutContext};
 use display_list_builder::{DisplayListBuildState, FlexFlowDisplayListBuilding};
 use euclid::Point2D;
 use floats::FloatKind;
@@ -26,8 +26,8 @@ use script_layout_interface::restyle_damage::{REFLOW, REFLOW_OUT_OF_FLOW};
 use std::cmp::{max, min};
 use std::ops::Range;
 use std::sync::Arc;
-use style::computed_values::border_collapse;
 use style::computed_values::{align_content, align_self, flex_direction, flex_wrap, justify_content};
+use style::computed_values::border_collapse;
 use style::context::{SharedStyleContext, StyleContext};
 use style::logical_geometry::LogicalSize;
 use style::properties::ServoComputedValues;
@@ -920,7 +920,7 @@ impl Flow for FlexFlow {
         }
     }
 
-    fn compute_absolute_position(&mut self, layout_context: &LayoutContext) {
+    fn compute_absolute_position(&mut self, layout_context: &SharedLayoutContext) {
         self.block_flow.compute_absolute_position(layout_context)
     }
 

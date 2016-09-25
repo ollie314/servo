@@ -4,12 +4,13 @@
 
 use euclid::size::TypedSize2D;
 use gecko_bindings::bindings::RawServoStyleSet;
+use gecko_bindings::sugar::ownership::{HasBoxFFI, HasFFI, HasSimpleFFI};
 use num_cpus;
 use std::cmp;
 use std::collections::HashMap;
 use std::env;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use style::animation::Animation;
 use style::context::SharedStyleContext;
 use style::dom::OpaqueNode;
@@ -17,9 +18,9 @@ use style::media_queries::{Device, MediaType};
 use style::parallel::WorkQueueData;
 use style::selector_matching::Stylist;
 use style::stylesheets::Stylesheet;
+use style::thread_state;
 use style::workqueue::WorkQueue;
 use style_traits::ViewportPx;
-use util::thread_state;
 
 pub struct PerDocumentStyleData {
     /// Rule processor.
@@ -38,7 +39,7 @@ pub struct PerDocumentStyleData {
     pub expired_animations: Arc<RwLock<HashMap<OpaqueNode, Vec<Animation>>>>,
 
     // FIXME(bholley): This shouldn't be per-document.
-    pub work_queue: WorkQueue<SharedStyleContext, WorkQueueData>,
+    pub work_queue: Option<WorkQueue<SharedStyleContext, WorkQueueData>>,
 
     pub num_threads: usize,
 }
@@ -68,13 +69,13 @@ impl PerDocumentStyleData {
             new_animations_receiver: new_anims_receiver,
             running_animations: Arc::new(RwLock::new(HashMap::new())),
             expired_animations: Arc::new(RwLock::new(HashMap::new())),
-            work_queue: WorkQueue::new("StyleWorker", thread_state::LAYOUT, *NUM_THREADS),
+            work_queue: if *NUM_THREADS <= 1 {
+                None
+            } else {
+                WorkQueue::new("StyleWorker", thread_state::LAYOUT, *NUM_THREADS).ok()
+            },
             num_threads: *NUM_THREADS,
         }
-    }
-
-    pub fn borrow_mut_from_raw<'a>(data: *mut RawServoStyleSet) -> &'a mut Self {
-        unsafe { &mut *(data as *mut PerDocumentStyleData) }
     }
 
     pub fn flush_stylesheets(&mut self) {
@@ -83,14 +84,22 @@ impl PerDocumentStyleData {
         // need to detect the latter case and trigger a flush as well.
         if self.stylesheets_changed {
             let _ = Arc::get_mut(&mut self.stylist).unwrap()
-                                                   .update(&self.stylesheets, true);
+                                                   .update(&self.stylesheets, None, true);
             self.stylesheets_changed = false;
         }
     }
 }
 
+unsafe impl HasFFI for PerDocumentStyleData {
+    type FFIType = RawServoStyleSet;
+}
+unsafe impl HasSimpleFFI for PerDocumentStyleData {}
+unsafe impl HasBoxFFI for PerDocumentStyleData {}
+
 impl Drop for PerDocumentStyleData {
     fn drop(&mut self) {
-        self.work_queue.shutdown();
+        if let Some(ref mut queue) = self.work_queue {
+            queue.shutdown();
+        }
     }
 }

@@ -19,35 +19,36 @@ use context::LayoutContext;
 use data::{HAS_NEWLY_CONSTRUCTED_FLOW, PrivateLayoutData};
 use flex::FlexFlow;
 use floats::FloatKind;
-use flow::{MutableFlowUtils, MutableOwnedFlowUtils, CAN_BE_FRAGMENTED};
 use flow::{self, AbsoluteDescendants, IS_ABSOLUTELY_POSITIONED, ImmutableFlowUtils};
+use flow::{CAN_BE_FRAGMENTED, MutableFlowUtils, MutableOwnedFlowUtils};
 use flow_ref::{self, FlowRef};
-use fragment::WhitespaceStrippingResult;
 use fragment::{CanvasFragmentInfo, ImageFragmentInfo, InlineAbsoluteFragmentInfo};
 use fragment::{Fragment, GeneratedContentInfo, IframeFragmentInfo};
 use fragment::{InlineAbsoluteHypotheticalFragmentInfo, TableColumnFragmentInfo};
 use fragment::{InlineBlockFragmentInfo, SpecificFragmentInfo, UnscannedTextFragmentInfo};
+use fragment::WhitespaceStrippingResult;
 use gfx::display_list::OpaqueNode;
 use inline::{FIRST_FRAGMENT_OF_ELEMENT, InlineFlow, InlineFragmentNodeFlags};
 use inline::{InlineFragmentNodeInfo, LAST_FRAGMENT_OF_ELEMENT};
 use linked_list::prepend_from;
 use list_item::{ListItemFlow, ListStyleTypeContent};
-use multicol::{MulticolFlow, MulticolColumnFlow};
+use multicol::{MulticolColumnFlow, MulticolFlow};
 use parallel;
+use script_layout_interface::{LayoutElementType, LayoutNodeType, is_image_data};
 use script_layout_interface::restyle_damage::{BUBBLE_ISIZES, RECONSTRUCT_FLOW, RestyleDamage};
-use script_layout_interface::wrapper_traits::{ThreadSafeLayoutNode, PseudoElementType, ThreadSafeLayoutElement};
-use script_layout_interface::{LayoutNodeType, LayoutElementType, is_image_data};
+use script_layout_interface::wrapper_traits::{PseudoElementType, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
 use std::borrow::ToOwned;
 use std::collections::LinkedList;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use style::computed_values::{caption_side, display, empty_cells, float, list_style_position};
 use style::computed_values::content::ContentItem;
 use style::computed_values::position;
-use style::computed_values::{caption_side, display, empty_cells, float, list_style_position};
 use style::context::SharedStyleContext;
 use style::properties::{self, ServoComputedValues};
+use style::servo_selector_impl::PseudoElement;
 use table::TableFlow;
 use table_caption::TableCaptionFlow;
 use table_cell::TableCellFlow;
@@ -308,13 +309,13 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
             Some(LayoutNodeType::Element(LayoutElementType::HTMLImageElement)) => {
                 let image_info = box ImageFragmentInfo::new(node,
                                                             node.image_url(),
-                                                            &self.layout_context);
+                                                            &self.layout_context.shared);
                 SpecificFragmentInfo::Image(image_info)
             }
             Some(LayoutNodeType::Element(LayoutElementType::HTMLObjectElement)) => {
                 let image_info = box ImageFragmentInfo::new(node,
                                                             node.object_data(),
-                                                            &self.layout_context);
+                                                            &self.layout_context.shared);
                 SpecificFragmentInfo::Image(image_info)
             }
             Some(LayoutNodeType::Element(LayoutElementType::HTMLTableElement)) => {
@@ -332,7 +333,7 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
             }
             Some(LayoutNodeType::Element(LayoutElementType::HTMLCanvasElement)) => {
                 let data = node.canvas_data().unwrap();
-                SpecificFragmentInfo::Canvas(box CanvasFragmentInfo::new(node, data, self.layout_context))
+                SpecificFragmentInfo::Canvas(box CanvasFragmentInfo::new(node, data, self.style_context()))
             }
             _ => {
                 // This includes pseudo-elements.
@@ -693,7 +694,8 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
 
             let mut style = node.style(self.style_context()).clone();
             if node_is_input_or_text_area {
-                properties::modify_style_for_input_text(&mut style);
+                style = self.style_context().stylist.
+                    precomputed_values_for_pseudo(&PseudoElement::ServoInputText, Some(&style)).unwrap();
             }
 
             self.create_fragments_for_node_text_content(&mut initial_fragments, node, &style)
@@ -1267,7 +1269,7 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
             Some(ref url) => {
                 let image_info = box ImageFragmentInfo::new(node,
                                                             Some((*url).clone()),
-                                                            &self.layout_context);
+                                                            &self.layout_context.shared);
                 vec![Fragment::new(node, SpecificFragmentInfo::Image(image_info), self.layout_context)]
             }
             None => {
@@ -1408,88 +1410,98 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
             return false
         }
 
-        let mut style = node.style(self.style_context()).clone();
-        let mut data = node.mutate_layout_data().unwrap();
-        let damage = data.restyle_damage;
-        match *node.construction_result_mut(&mut *data) {
-            ConstructionResult::None => true,
-            ConstructionResult::Flow(ref mut flow, _) => {
-                // The node's flow is of the same type and has the same set of children and can
-                // therefore be repaired by simply propagating damage and style to the flow.
-                if !flow.is_block_flow() {
-                    return false
-                }
-                let flow = flow_ref::deref_mut(flow);
-                flow::mut_base(flow).restyle_damage.insert(damage);
-                flow.repair_style_and_bubble_inline_sizes(&style);
-                true
-            }
-            ConstructionResult::ConstructionItem(ConstructionItem::InlineFragments(
-                    ref mut inline_fragments_construction_result)) => {
-                if !inline_fragments_construction_result.splits.is_empty() {
-                    return false
-                }
+        let mut set_has_newly_constructed_flow_flag = false;
+        let result = {
+            let mut style = node.style(self.style_context()).clone();
+            let mut data = node.mutate_layout_data().unwrap();
+            let damage = data.restyle_damage;
 
-                for fragment in inline_fragments_construction_result.fragments
-                                                                    .fragments
-                                                                    .iter_mut() {
-                    // Only mutate the styles of fragments that represent the dirty node (including
-                    // pseudo-element).
-                    if fragment.node != node.opaque() {
-                        continue
-                    }
-                    if fragment.pseudo != node.get_pseudo_element_type().strip() {
-                        continue
+            match *node.construction_result_mut(&mut *data) {
+                ConstructionResult::None => true,
+                ConstructionResult::Flow(ref mut flow, _) => {
+                    // The node's flow is of the same type and has the same set of children and can
+                    // therefore be repaired by simply propagating damage and style to the flow.
+                    if !flow.is_block_flow() {
+                        return false
                     }
 
-                    match fragment.specific {
-                        SpecificFragmentInfo::InlineBlock(ref mut inline_block_fragment) => {
-                            let flow_ref = flow_ref::deref_mut(&mut inline_block_fragment.flow_ref);
-                            flow::mut_base(flow_ref).restyle_damage.insert(damage);
-                            // FIXME(pcwalton): Fragment restyle damage too?
-                            flow_ref.repair_style_and_bubble_inline_sizes(&style);
+                    let flow = flow_ref::deref_mut(flow);
+                    flow::mut_base(flow).restyle_damage.insert(damage);
+                    flow.repair_style_and_bubble_inline_sizes(&style);
+                    true
+                }
+                ConstructionResult::ConstructionItem(ConstructionItem::InlineFragments(
+                        ref mut inline_fragments_construction_result)) => {
+                    if !inline_fragments_construction_result.splits.is_empty() {
+                        return false
+                    }
+
+                    for fragment in inline_fragments_construction_result.fragments
+                                                                        .fragments
+                                                                        .iter_mut() {
+                        // Only mutate the styles of fragments that represent the dirty node (including
+                        // pseudo-element).
+                        if fragment.node != node.opaque() {
+                            continue
                         }
-                        SpecificFragmentInfo::InlineAbsoluteHypothetical(
-                                ref mut inline_absolute_hypothetical_fragment) => {
-                            let flow_ref = flow_ref::deref_mut(
-                                &mut inline_absolute_hypothetical_fragment.flow_ref);
-                            flow::mut_base(flow_ref).restyle_damage.insert(damage);
-                            // FIXME(pcwalton): Fragment restyle damage too?
-                            flow_ref.repair_style_and_bubble_inline_sizes(&style);
+                        if fragment.pseudo != node.get_pseudo_element_type().strip() {
+                            continue
                         }
-                        SpecificFragmentInfo::InlineAbsolute(ref mut inline_absolute_fragment) => {
-                            let flow_ref = flow_ref::deref_mut(
-                                &mut inline_absolute_fragment.flow_ref);
-                            flow::mut_base(flow_ref).restyle_damage.insert(damage);
-                            // FIXME(pcwalton): Fragment restyle damage too?
-                            flow_ref.repair_style_and_bubble_inline_sizes(&style);
-                        }
-                        SpecificFragmentInfo::ScannedText(_) => {
-                            // Text fragments in ConstructionResult haven't been scanned yet
-                            unreachable!()
-                        }
-                        SpecificFragmentInfo::GeneratedContent(_) |
-                        SpecificFragmentInfo::UnscannedText(_) => {
-                            // We can't repair this unscanned text; we need to update the
-                            // scanned text fragments.
-                            //
-                            // TODO: Add code to find and repair the ScannedText fragments?
-                            return false
-                        }
-                        _ => {
-                            if node.is_replaced_content() {
-                                properties::modify_style_for_replaced_content(&mut style);
+
+                        match fragment.specific {
+                            SpecificFragmentInfo::InlineBlock(ref mut inline_block_fragment) => {
+                                let flow_ref = flow_ref::deref_mut(&mut inline_block_fragment.flow_ref);
+                                flow::mut_base(flow_ref).restyle_damage.insert(damage);
+                                // FIXME(pcwalton): Fragment restyle damage too?
+                                flow_ref.repair_style_and_bubble_inline_sizes(&style);
                             }
-                            fragment.repair_style(&style);
+                            SpecificFragmentInfo::InlineAbsoluteHypothetical(
+                                    ref mut inline_absolute_hypothetical_fragment) => {
+                                let flow_ref = flow_ref::deref_mut(
+                                    &mut inline_absolute_hypothetical_fragment.flow_ref);
+                                flow::mut_base(flow_ref).restyle_damage.insert(damage);
+                                // FIXME(pcwalton): Fragment restyle damage too?
+                                flow_ref.repair_style_and_bubble_inline_sizes(&style);
+                            }
+                            SpecificFragmentInfo::InlineAbsolute(ref mut inline_absolute_fragment) => {
+                                let flow_ref = flow_ref::deref_mut(
+                                    &mut inline_absolute_fragment.flow_ref);
+                                flow::mut_base(flow_ref).restyle_damage.insert(damage);
+                                // FIXME(pcwalton): Fragment restyle damage too?
+                                flow_ref.repair_style_and_bubble_inline_sizes(&style);
+                            }
+                            SpecificFragmentInfo::ScannedText(_) => {
+                                // Text fragments in ConstructionResult haven't been scanned yet
+                                unreachable!()
+                            }
+                            SpecificFragmentInfo::GeneratedContent(_) |
+                            SpecificFragmentInfo::UnscannedText(_) => {
+                                // We can't repair this unscanned text; we need to update the
+                                // scanned text fragments.
+                                //
+                                // TODO: Add code to find and repair the ScannedText fragments?
+                                return false
+                            }
+                            _ => {
+                                if node.is_replaced_content() {
+                                    properties::modify_style_for_replaced_content(&mut style);
+                                }
+                                fragment.repair_style(&style);
+                                set_has_newly_constructed_flow_flag = true;
+                            }
                         }
                     }
+                    true
                 }
-                true
+                ConstructionResult::ConstructionItem(_) => {
+                    false
+                }
             }
-            ConstructionResult::ConstructionItem(_) => {
-                false
-            }
+        };
+        if set_has_newly_constructed_flow_flag {
+            node.insert_flags(HAS_NEWLY_CONSTRUCTED_FLOW);
         }
+        return result;
     }
 }
 

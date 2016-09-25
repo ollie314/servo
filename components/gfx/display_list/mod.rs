@@ -17,14 +17,14 @@
 use app_units::Au;
 use azure::azure::AzFloat;
 use azure::azure_hl::Color;
+use euclid::{Matrix4D, Point2D, Rect, Size2D};
 use euclid::approxeq::ApproxEq;
 use euclid::num::{One, Zero};
 use euclid::rect::TypedRect;
 use euclid::side_offsets::SideOffsets2D;
-use euclid::{Matrix2D, Matrix4D, Point2D, Rect, Size2D};
 use fnv::FnvHasher;
-use gfx_traits::print_tree::PrintTree;
 use gfx_traits::{LayerId, ScrollPolicy, StackingContextId};
+use gfx_traits::print_tree::PrintTree;
 use ipc_channel::ipc::IpcSharedMemory;
 use msg::constellation_msg::PipelineId;
 use net_traits::image::base::{Image, PixelFormat};
@@ -44,7 +44,7 @@ use style::computed_values::{border_style, filter, image_rendering, mix_blend_mo
 use style_traits::cursor::Cursor;
 use text::TextRun;
 use text::glyph::ByteIndex;
-use util::geometry::{self, max_rect, ScreenPx};
+use util::geometry::{self, ScreenPx, max_rect};
 use webrender_traits::{self, WebGLContextId};
 
 pub use style::dom::OpaqueNode;
@@ -339,10 +339,7 @@ impl DisplayList {
                                            transform: &Matrix4D<f32>,
                                            index: usize) {
         let old_transform = paint_context.draw_target.get_transform();
-        paint_context.draw_target.set_transform(
-            &Matrix2D::new(transform.m11, transform.m12,
-                           transform.m21, transform.m22,
-                           transform.m41, transform.m42));
+        paint_context.draw_target.set_transform(&transform.to_2d());
 
         let item = &self.list[index];
         item.draw_into_context(paint_context);
@@ -459,9 +456,11 @@ impl DisplayList {
                     Point2D::new(origin.x.to_nearest_pixel(pixels_per_px.get()),
                                  origin.y.to_nearest_pixel(pixels_per_px.get()));
 
-                let transform = transform.translate(pixel_snapped_origin.x as AzFloat,
-                                                    pixel_snapped_origin.y as AzFloat,
-                                                    0.0).mul(&stacking_context.transform);
+                let transform = transform
+                    .pre_translated(pixel_snapped_origin.x as AzFloat,
+                                    pixel_snapped_origin.y as AzFloat,
+                                    0.0)
+                    .pre_mul(&stacking_context.transform);
 
                 if transform.is_identity_or_simple_translation() {
                     let pixel_snapped_origin = Point2D::new(Au::from_f32_px(pixel_snapped_origin.x),
@@ -477,6 +476,18 @@ impl DisplayList {
             }
         };
 
+        let transformed_transform =
+            match transformed_tile_rect(paint_context.screen_rect, &transform) {
+                Some(transformed) => transformed,
+                None => {
+                    // https://drafts.csswg.org/css-transforms/#transform-function-lists
+                    // If a transform function causes the current transformation matrix (CTM)
+                    // of an object to be non-invertible, the object and its content do not
+                    // get displayed.
+                    return;
+                },
+            };
+
         {
             let mut paint_subcontext = PaintContext {
                 draw_target: draw_target.clone(),
@@ -490,10 +501,7 @@ impl DisplayList {
             };
 
             // Set up our clip rect and transform.
-            paint_subcontext.draw_target.set_transform(
-                &Matrix2D::new(transform.m11, transform.m12,
-                               transform.m21, transform.m22,
-                               transform.m41, transform.m42));
+            paint_subcontext.draw_target.set_transform(&transform.to_2d());
             paint_subcontext.push_clip_if_applicable();
 
             self.draw_stacking_context_contents(
@@ -502,7 +510,7 @@ impl DisplayList {
                 &mut paint_subcontext,
                 &transform,
                 &subpixel_offset,
-                Some(transformed_tile_rect(paint_context.screen_rect, &transform)));
+                Some(transformed_transform));
 
             paint_subcontext.remove_transient_clip_if_applicable();
             paint_subcontext.pop_clip_if_applicable();
@@ -535,17 +543,20 @@ impl DisplayList {
     }
 }
 
-fn transformed_tile_rect(tile_rect: TypedRect<usize, ScreenPx>, transform: &Matrix4D<f32>) -> Rect<Au> {
+fn transformed_tile_rect(tile_rect: TypedRect<usize, ScreenPx>,
+                         transform: &Matrix4D<f32>)
+                         -> Option<Rect<Au>> {
     // Invert the current transform, then use this to back transform
     // the tile rect (placed at the origin) into the space of this
     // stacking context.
-    let inverse_transform = transform.invert();
-    let inverse_transform_2d = Matrix2D::new(inverse_transform.m11, inverse_transform.m12,
-                                             inverse_transform.m21, inverse_transform.m22,
-                                             inverse_transform.m41, inverse_transform.m42);
-    let tile_size = Size2D::new(tile_rect.as_f32().size.width, tile_rect.as_f32().size.height);
+    let inverse_transform = match transform.inverse() {
+        Some(inverse) => inverse,
+        None => return None,
+    };
+    let inverse_transform_2d = inverse_transform.to_2d();
+    let tile_size = Size2D::new(tile_rect.to_f32().size.width, tile_rect.to_f32().size.height);
     let tile_rect = Rect::new(Point2D::zero(), tile_size).to_untyped();
-    geometry::f32_rect_to_au_rect(inverse_transform_2d.transform_rect(&tile_rect))
+    Some(geometry::f32_rect_to_au_rect(inverse_transform_2d.transform_rect(&tile_rect)))
 }
 
 
@@ -699,39 +710,41 @@ impl StackingContext {
         let origin_x = self.bounds.origin.x.to_f32_px();
         let origin_y = self.bounds.origin.y.to_f32_px();
 
-        let transform = Matrix4D::identity().translate(origin_x, origin_y, 0.0)
-                                            .mul(&self.transform);
-        let transform_2d = Matrix2D::new(transform.m11, transform.m12,
-                                         transform.m21, transform.m22,
-                                         transform.m41, transform.m42);
+        let transform = Matrix4D::identity().pre_translated(origin_x, origin_y, 0.0)
+                                            .pre_mul(&self.transform);
+        let transform_2d = transform.to_2d();
 
         let overflow = geometry::au_rect_to_f32_rect(self.overflow);
         let overflow = transform_2d.transform_rect(&overflow);
         geometry::f32_rect_to_au_rect(overflow)
     }
 
-    pub fn hit_test<'a>(&self,
-                        traversal: &mut DisplayListTraversal<'a>,
-                        translated_point: &Point2D<Au>,
-                        client_point: &Point2D<Au>,
-                        scroll_offsets: &ScrollOffsetMap,
-                        result: &mut Vec<DisplayItemMetadata>) {
+    fn hit_test<'a>(&self,
+                    traversal: &mut DisplayListTraversal<'a>,
+                    translated_point: &Point2D<Au>,
+                    client_point: &Point2D<Au>,
+                    scroll_offsets: &ScrollOffsetMap,
+                    result: &mut Vec<DisplayItemMetadata>) {
         let is_fixed = match self.layer_info {
             Some(ref layer_info) => layer_info.scroll_policy == ScrollPolicy::FixedPosition,
             None => false,
         };
 
-        let effective_point = if is_fixed { client_point } else { translated_point };
-
-        // Convert the point into stacking context local transform space.
-        let mut point = if self.context_type == StackingContextType::Real {
-            let point = *effective_point - self.bounds.origin;
-            let inv_transform = self.transform.invert();
+        // Convert the parent translated point into stacking context local
+        // transform space if the stacking context isn't fixed.
+        //
+        // If it's fixed, we need to use the client point anyway, and if it's a
+        // pseudo-stacking context, our parent's is enough.
+        let mut translated_point = if is_fixed {
+            *client_point
+        } else if self.context_type == StackingContextType::Real {
+            let point = *translated_point - self.bounds.origin;
+            let inv_transform = self.transform.inverse().unwrap();
             let frac_point = inv_transform.transform_point(&Point2D::new(point.x.to_f32_px(),
                                                                          point.y.to_f32_px()));
             Point2D::new(Au::from_f32_px(frac_point.x), Au::from_f32_px(frac_point.y))
         } else {
-            *effective_point
+            *translated_point
         };
 
         // Adjust the translated point to account for the scroll offset if
@@ -742,22 +755,23 @@ impl StackingContext {
         // `Window::hit_test_query()`) by now.
         if !is_fixed && self.id != StackingContextId::root() {
             if let Some(scroll_offset) = scroll_offsets.get(&self.id) {
-                point.x -= Au::from_f32_px(scroll_offset.x);
-                point.y -= Au::from_f32_px(scroll_offset.y);
+                translated_point.x -= Au::from_f32_px(scroll_offset.x);
+                translated_point.y -= Au::from_f32_px(scroll_offset.y);
             }
         }
 
         for child in self.children() {
             while let Some(item) = traversal.advance(self) {
-                if let Some(meta) = item.hit_test(point) {
+                if let Some(meta) = item.hit_test(translated_point) {
                     result.push(meta);
                 }
             }
-            child.hit_test(traversal, translated_point, client_point, scroll_offsets, result);
+            child.hit_test(traversal, &translated_point, client_point,
+                           scroll_offsets, result);
         }
 
         while let Some(item) = traversal.advance(self) {
-            if let Some(meta) = item.hit_test(point) {
+            if let Some(meta) = item.hit_test(translated_point) {
                 result.push(meta);
             }
         }
@@ -1134,6 +1148,10 @@ pub struct ImageDisplayItem {
     /// direction to tile the entire bounds.
     pub stretch_size: Size2D<Au>,
 
+    /// The amount of space to add to the right and bottom part of each tile, when the image
+    /// is tiled.
+    pub tile_spacing: Size2D<Au>,
+
     /// The algorithm we should use to stretch the image. See `image_rendering` in CSS-IMAGES-3 §
     /// 5.3.
     pub image_rendering: image_rendering::T,
@@ -1346,6 +1364,7 @@ impl DisplayItem {
                 paint_context.draw_image(
                     &image_item.base.bounds,
                     &image_item.stretch_size,
+                    &image_item.tile_spacing,
                     &image_item.webrender_image,
                     &image_item.image_data
                                .as_ref()

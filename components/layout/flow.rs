@@ -27,16 +27,16 @@
 
 use app_units::Au;
 use block::{BlockFlow, FormattingContextType};
-use context::LayoutContext;
+use context::{LayoutContext, SharedLayoutContext};
 use display_list_builder::DisplayListBuildState;
 use euclid::{Point2D, Rect, Size2D};
 use floats::{Floats, SpeculatedFloatPlacement};
-use flow_list::{FlowList, FlowListIterator, MutFlowListIterator};
+use flow_list::{FlowList, MutFlowListIterator};
 use flow_ref::{self, FlowRef, WeakFlowRef};
 use fragment::{Fragment, FragmentBorderBoxIterator, Overflow, SpecificFragmentInfo};
 use gfx::display_list::{ClippingRegion, StackingContext};
-use gfx_traits::print_tree::PrintTree;
 use gfx_traits::{LayerId, LayerType, StackingContextId};
+use gfx_traits::print_tree::PrintTree;
 use inline::InlineFlow;
 use model::{CollapsibleMargins, IntrinsicISizes, MarginCollapseInfo};
 use multicol::MulticolFlow;
@@ -44,12 +44,12 @@ use parallel::FlowParallelInfo;
 use rustc_serialize::{Encodable, Encoder};
 use script_layout_interface::restyle_damage::{RECONSTRUCT_FLOW, REFLOW, REFLOW_OUT_OF_FLOW, REPAINT, RestyleDamage};
 use script_layout_interface::wrapper_traits::{PseudoElementType, ThreadSafeLayoutNode};
+use std::{fmt, mem, raw};
 use std::iter::Zip;
 use std::slice::IterMut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::{fmt, mem, raw};
-use style::computed_values::{clear, display, empty_cells, float, position, overflow_x, text_align};
+use style::computed_values::{clear, display, empty_cells, float, overflow_x, position, text_align};
 use style::context::SharedStyleContext;
 use style::dom::TRestyleDamage;
 use style::logical_geometry::{LogicalRect, LogicalSize, WritingMode};
@@ -318,7 +318,7 @@ pub trait Flow: fmt::Debug + Sync + Send + 'static {
     }
 
     /// Phase 4 of reflow: computes absolute positions.
-    fn compute_absolute_position(&mut self, _: &LayoutContext) {
+    fn compute_absolute_position(&mut self, _: &SharedLayoutContext) {
         // The default implementation is a no-op.
     }
 
@@ -432,7 +432,7 @@ pub fn base<T: ?Sized + Flow>(this: &T) -> &BaseFlow {
 }
 
 /// Iterates over the children of this immutable flow.
-pub fn child_iter<'a>(flow: &'a Flow) -> FlowListIterator<'a> {
+pub fn child_iter<'a>(flow: &'a Flow) -> impl Iterator<Item = &'a Flow> {
     base(flow).children.iter()
 }
 
@@ -997,7 +997,7 @@ impl fmt::Debug for BaseFlow {
 
 impl Encodable for BaseFlow {
     fn encode<S: Encoder>(&self, e: &mut S) -> Result<(), S::Error> {
-        e.emit_struct("base", 0, |e| {
+        e.emit_struct("base", 5, |e| {
             try!(e.emit_struct_field("id", 0, |e| self.debug_id().encode(e)));
             try!(e.emit_struct_field("stacking_relative_position",
                                      1,
@@ -1010,7 +1010,7 @@ impl Encodable for BaseFlow {
                 e.emit_seq(self.children.len(), |e| {
                     for (i, c) in self.children.iter().enumerate() {
                         try!(e.emit_seq_elt(i, |e| {
-                            try!(e.emit_struct("flow", 0, |e| {
+                            try!(e.emit_struct("flow", 2, |e| {
                                 try!(e.emit_struct_field("class", 0, |e| c.class().encode(e)));
                                 e.emit_struct_field("data", 1, |e| {
                                     match c.class() {
@@ -1405,7 +1405,8 @@ impl<'a> ImmutableFlowUtils for &'a Flow {
                 return kid.as_inline().baseline_offset_of_last_line()
             }
             if kid.is_block_like() &&
-                    kid.as_block().formatting_context_type() == FormattingContextType::None {
+                    kid.as_block().formatting_context_type() == FormattingContextType::None &&
+                    !base(kid).flags.contains(IS_ABSOLUTELY_POSITIONED) {
                 if let Some(baseline_offset) = kid.baseline_offset_of_last_line_box_in_flow() {
                     return Some(base(kid).position.start.b + baseline_offset)
                 }

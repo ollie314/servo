@@ -8,7 +8,7 @@
 
 use app_units::Au;
 use canvas_traits::CanvasMsg;
-use context::LayoutContext;
+use context::{LayoutContext, SharedLayoutContext};
 use euclid::{Point2D, Rect, Size2D};
 use floats::ClearType;
 use flow::{self, ImmutableFlowUtils};
@@ -38,16 +38,17 @@ use std::collections::LinkedList;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use style::arc_ptr_eq;
-use style::computed_values::content::ContentItem;
 use style::computed_values::{border_collapse, box_sizing, clear, color, display, mix_blend_mode};
 use style::computed_values::{overflow_wrap, overflow_x, position, text_decoration};
 use style::computed_values::{transform_style, vertical_align, white_space, word_break, z_index};
+use style::computed_values::content::ContentItem;
+use style::context::SharedStyleContext;
 use style::dom::TRestyleDamage;
 use style::logical_geometry::{LogicalMargin, LogicalRect, LogicalSize, WritingMode};
 use style::properties::ServoComputedValues;
 use style::str::char_is_whitespace;
-use style::values::computed::LengthOrPercentageOrNone;
 use style::values::computed::{LengthOrPercentage, LengthOrPercentageOrAuto};
+use style::values::computed::LengthOrPercentageOrNone;
 use text;
 use text::TextRunScanner;
 use url::Url;
@@ -132,7 +133,7 @@ pub struct Fragment {
 
 impl Encodable for Fragment {
     fn encode<S: Encoder>(&self, e: &mut S) -> Result<(), S::Error> {
-        e.emit_struct("fragment", 0, |e| {
+        e.emit_struct("fragment", 3, |e| {
             try!(e.emit_struct_field("id", 0, |e| self.debug_id.encode(e)));
             try!(e.emit_struct_field("border_box", 1, |e| self.border_box.encode(e)));
             e.emit_struct_field("margin", 2, |e| self.margin.encode(e))
@@ -323,7 +324,10 @@ pub struct CanvasFragmentInfo {
 }
 
 impl CanvasFragmentInfo {
-    pub fn new<N: ThreadSafeLayoutNode>(node: &N, data: HTMLCanvasData, ctx: &LayoutContext) -> CanvasFragmentInfo {
+    pub fn new<N: ThreadSafeLayoutNode>(node: &N,
+                                        data: HTMLCanvasData,
+                                        ctx: &SharedStyleContext)
+                                        -> CanvasFragmentInfo {
         CanvasFragmentInfo {
             replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, ctx),
             ipc_renderer: data.ipc_renderer
@@ -368,9 +372,10 @@ impl ImageFragmentInfo {
     /// FIXME(pcwalton): The fact that image fragments store the cache in the fragment makes little
     /// sense to me.
     pub fn new<N: ThreadSafeLayoutNode>(node: &N, url: Option<Url>,
-                                        layout_context: &LayoutContext) -> ImageFragmentInfo {
+                                        shared_layout_context: &SharedLayoutContext)
+                                        -> ImageFragmentInfo {
         let image_or_metadata = url.and_then(|url| {
-            layout_context.get_or_request_image_or_meta(url, UsePlaceholder::Yes)
+            shared_layout_context.get_or_request_image_or_meta(url, UsePlaceholder::Yes)
         });
 
         let (image, metadata) = match image_or_metadata {
@@ -386,7 +391,7 @@ impl ImageFragmentInfo {
         };
 
         ImageFragmentInfo {
-            replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, layout_context),
+            replaced_image_fragment_info: ReplacedImageFragmentInfo::new(node, &shared_layout_context.style_context),
             image: image,
             metadata: metadata,
         }
@@ -420,18 +425,73 @@ impl ImageFragmentInfo {
         }
     }
 
+    pub fn tile_image_round(position: &mut Au,
+                            size: &mut Au,
+                            absolute_anchor_origin: Au,
+                            image_size: &mut Au) {
+        if *size == Au(0) || *image_size == Au(0) {
+            *position = Au(0);
+            *size =Au(0);
+            return;
+        }
+
+        let number_of_tiles = (size.to_f32_px() / image_size.to_f32_px()).round().max(1.0);
+        *image_size = *size / (number_of_tiles as i32);
+        ImageFragmentInfo::tile_image(position, size, absolute_anchor_origin, *image_size);
+    }
+
+    pub fn tile_image_spaced(position: &mut Au,
+                             size: &mut Au,
+                             tile_spacing: &mut Au,
+                             absolute_anchor_origin: Au,
+                             image_size: Au) {
+        if *size == Au(0) || image_size == Au(0) {
+            *position = Au(0);
+            *size = Au(0);
+            *tile_spacing = Au(0);
+            return;
+        }
+
+        // Per the spec, if the space available is not enough for two images, just tile as
+        // normal but only display a single tile.
+        if image_size * 2 >= *size {
+            ImageFragmentInfo::tile_image(position,
+                                          size,
+                                          absolute_anchor_origin,
+                                          image_size);
+            *tile_spacing = Au(0);
+            *size = image_size;;
+            return;
+        }
+
+        // Take the box size, remove room for two tiles on the edges, and then calculate how many
+        // other tiles fit in between them.
+        let size_remaining = *size - (image_size * 2);
+        let num_middle_tiles = (size_remaining.to_f32_px() / image_size.to_f32_px()).floor() as i32;
+
+        // Allocate the remaining space as padding between tiles. background-position is ignored
+        // as per the spec, so the position is just the box origin. We are also ignoring
+        // background-attachment here, which seems unspecced when combined with
+        // background-repeat: space.
+        let space_for_middle_tiles = image_size * num_middle_tiles;
+        *tile_spacing = (size_remaining - space_for_middle_tiles) / (num_middle_tiles + 1);
+    }
+
     /// Tile an image
-    pub fn tile_image(position: &mut Au, size: &mut Au, virtual_position: Au, image_size: u32) {
+    pub fn tile_image(position: &mut Au,
+                      size: &mut Au,
+                      absolute_anchor_origin: Au,
+                      image_size: Au) {
         // Avoid division by zero below!
-        let image_size = image_size as i32;
-        if image_size == 0 {
+        if image_size == Au(0) {
             return
         }
 
-        let delta_pixels = (virtual_position - *position).to_px();
-        let tile_count = (delta_pixels + image_size - 1) / image_size;
-        let offset = Au::from_px(image_size * tile_count);
-        let new_position = virtual_position - offset;
+        let delta_pixels = absolute_anchor_origin - *position;
+        let image_size_px = image_size.to_f32_px();
+        let tile_count = ((delta_pixels.to_f32_px() + image_size_px - 1.0) / image_size_px).floor();
+        let offset = image_size * (tile_count as i32);
+        let new_position = absolute_anchor_origin - offset;
         *size = *position - new_position + *size;
         *position = new_position;
     }
@@ -445,9 +505,9 @@ pub struct ReplacedImageFragmentInfo {
 }
 
 impl ReplacedImageFragmentInfo {
-    pub fn new<N>(node: &N, ctx: &LayoutContext) -> ReplacedImageFragmentInfo
+    pub fn new<N>(node: &N, ctx: &SharedStyleContext) -> ReplacedImageFragmentInfo
             where N: ThreadSafeLayoutNode {
-        let is_vertical = node.style(ctx.style_context()).writing_mode.is_vertical();
+        let is_vertical = node.style(ctx).writing_mode.is_vertical();
         ReplacedImageFragmentInfo {
             computed_inline_size: None,
             computed_block_size: None,
@@ -2008,10 +2068,8 @@ impl Fragment {
                 let font_derived_metrics =
                     InlineMetrics::from_font_metrics(&info.run.font_metrics, line_height);
                 InlineMetrics {
-                    block_size_above_baseline: font_derived_metrics.block_size_above_baseline +
-                                                   self.border_padding.block_start,
-                    depth_below_baseline: font_derived_metrics.depth_below_baseline +
-                        self.border_padding.block_end,
+                    block_size_above_baseline: font_derived_metrics.block_size_above_baseline,
+                    depth_below_baseline: font_derived_metrics.depth_below_baseline,
                     ascent: font_derived_metrics.ascent + self.border_padding.block_start,
                 }
             }

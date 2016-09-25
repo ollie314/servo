@@ -9,33 +9,36 @@ use element_state::*;
 use error_reporting::StdoutErrorReporter;
 use keyframes::KeyframesAnimation;
 use media_queries::{Device, MediaType};
-use properties::{self, PropertyDeclaration, PropertyDeclarationBlock, ComputedValues};
+use properties::{self, PropertyDeclaration, PropertyDeclarationBlock, ComputedValues, Importance};
+use quickersort::sort_by;
 use restyle_hints::{RestyleHint, DependencySet};
 use selector_impl::{ElementExt, TheSelectorImpl, PseudoElement};
 use selectors::Element;
 use selectors::bloom::BloomFilter;
-use selectors::matching::DeclarationBlock as GenericDeclarationBlock;
 use selectors::matching::{AFFECTED_BY_STYLE_ATTRIBUTE, AFFECTED_BY_PRESENTATIONAL_HINTS};
-use selectors::matching::{Rule, SelectorMap, StyleRelations};
-use selectors::parser::Selector;
+use selectors::matching::{MatchingReason, StyleRelations, matches_complex_selector};
+use selectors::parser::{Selector, SimpleSelector, LocalName, ComplexSelector};
 use sink::Push;
 use smallvec::VecLike;
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::BuildHasherDefault;
+use std::hash::Hash;
+use std::slice;
 use std::sync::Arc;
 use string_cache::Atom;
 use style_traits::viewport::ViewportConstraints;
-use stylesheets::{CSSRule, CSSRuleIteratorExt, Origin, Stylesheet};
+use stylesheets::{CSSRule, CSSRuleIteratorExt, Origin, Stylesheet, UserAgentStylesheets};
 use viewport::{MaybeNew, ViewportRuleCascade};
 
-pub type DeclarationBlock = GenericDeclarationBlock<Vec<PropertyDeclaration>>;
+pub type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<::fnv::FnvHasher>>;
 
 /// This structure holds all the selectors and device characteristics
 /// for a given document. The selectors are converted into `Rule`s
 /// (defined in rust-selectors), and introduced in a `SelectorMap`
 /// depending on the pseudo-element (see `PerPseudoElementSelectorMap`),
-/// stylesheet origin (see `PerOriginSelectorMap`), and priority
-/// (see the `normal` and `important` fields in `PerOriginSelectorMap`).
+/// and stylesheet origin (see the fields of `PerPseudoElementSelectorMap`).
 ///
 /// This structure is effectively created once per pipeline, in the
 /// LayoutThread corresponding to that pipeline.
@@ -59,19 +62,15 @@ pub struct Stylist {
 
     /// The selector maps corresponding to a given pseudo-element
     /// (depending on the implementation)
-    pseudos_map: HashMap<PseudoElement,
-                         PerPseudoElementSelectorMap,
-                         BuildHasherDefault<::fnv::FnvHasher>>,
+    pseudos_map: FnvHashMap<PseudoElement, PerPseudoElementSelectorMap>,
 
     /// A map with all the animations indexed by name.
-    animations: HashMap<Atom, KeyframesAnimation>,
+    animations: FnvHashMap<Atom, KeyframesAnimation>,
 
     /// Applicable declarations for a given non-eagerly cascaded pseudo-element.
     /// These are eagerly computed once, and then used to resolve the new
     /// computed values on the fly on layout.
-    precomputed_pseudo_element_decls: HashMap<PseudoElement,
-                                              Vec<DeclarationBlock>,
-                                              BuildHasherDefault<::fnv::FnvHasher>>,
+    precomputed_pseudo_element_decls: FnvHashMap<PseudoElement, Vec<ApplicableDeclarationBlock>>,
 
     rules_source_order: usize,
 
@@ -96,9 +95,9 @@ impl Stylist {
             quirks_mode: false,
 
             element_map: PerPseudoElementSelectorMap::new(),
-            pseudos_map: HashMap::with_hasher(Default::default()),
-            animations: HashMap::with_hasher(Default::default()),
-            precomputed_pseudo_element_decls: HashMap::with_hasher(Default::default()),
+            pseudos_map: Default::default(),
+            animations: Default::default(),
+            precomputed_pseudo_element_decls: Default::default(),
             rules_source_order: 0,
             state_deps: DependencySet::new(),
 
@@ -116,32 +115,35 @@ impl Stylist {
         stylist
     }
 
-    pub fn update(&mut self, doc_stylesheets: &[Arc<Stylesheet>], stylesheets_changed: bool) -> bool {
+    pub fn update(&mut self,
+                  doc_stylesheets: &[Arc<Stylesheet>],
+                  ua_stylesheets: Option<&UserAgentStylesheets>,
+                  stylesheets_changed: bool) -> bool {
         if !(self.is_device_dirty || stylesheets_changed) {
             return false;
         }
 
         self.element_map = PerPseudoElementSelectorMap::new();
-        self.pseudos_map = HashMap::with_hasher(Default::default());
-        self.animations = HashMap::with_hasher(Default::default());
+        self.pseudos_map = Default::default();
+        self.animations = Default::default();
         TheSelectorImpl::each_eagerly_cascaded_pseudo_element(|pseudo| {
             self.pseudos_map.insert(pseudo, PerPseudoElementSelectorMap::new());
         });
 
-        self.precomputed_pseudo_element_decls = HashMap::with_hasher(Default::default());
+        self.precomputed_pseudo_element_decls = Default::default();
         self.rules_source_order = 0;
         self.state_deps.clear();
 
         self.sibling_affecting_selectors.clear();
         self.non_common_style_affecting_attributes_selectors.clear();
 
-        for ref stylesheet in TheSelectorImpl::get_user_or_user_agent_stylesheets().iter() {
-            self.add_stylesheet(&stylesheet);
-        }
+        if let Some(ua_stylesheets) = ua_stylesheets {
+            for stylesheet in &ua_stylesheets.user_or_user_agent_stylesheets {
+                self.add_stylesheet(&stylesheet);
+            }
 
-        if self.quirks_mode {
-            if let Some(s) = TheSelectorImpl::get_quirks_mode_stylesheet() {
-                self.add_stylesheet(s);
+            if self.quirks_mode {
+                self.add_stylesheet(&ua_stylesheets.quirks_mode_stylesheet);
             }
         }
 
@@ -159,12 +161,10 @@ impl Stylist {
         }
         let mut rules_source_order = self.rules_source_order;
 
-        // Take apart the StyleRule into individual Rules and insert
-        // them into the SelectorMap of that priority.
-        macro_rules! append(
-            ($style_rule: ident, $priority: ident) => {
-                if !$style_rule.declarations.$priority.is_empty() {
-                    for selector in &$style_rule.selectors {
+        for rule in stylesheet.effective_rules(&self.device) {
+            match *rule {
+                CSSRule::Style(ref style_rule) => {
+                    for selector in &style_rule.selectors {
                         let map = if let Some(ref pseudo) = selector.pseudo_element {
                             self.pseudos_map
                                 .entry(pseudo.clone())
@@ -174,28 +174,17 @@ impl Stylist {
                             self.element_map.borrow_for_origin(&stylesheet.origin)
                         };
 
-                        map.$priority.insert(Rule {
-                            selector: selector.compound_selectors.clone(),
-                            declarations: DeclarationBlock {
-                                specificity: selector.specificity,
-                                declarations: $style_rule.declarations.$priority.clone(),
-                                source_order: rules_source_order,
-                            },
+                        map.insert(Rule {
+                            selector: selector.complex_selector.clone(),
+                            declarations: style_rule.declarations.clone(),
+                            specificity: selector.specificity,
+                            source_order: rules_source_order,
                         });
                     }
-                }
-            };
-        );
-
-        for rule in stylesheet.effective_rules(&self.device) {
-            match *rule {
-                CSSRule::Style(ref style_rule) => {
-                    append!(style_rule, normal);
-                    append!(style_rule, important);
                     rules_source_order += 1;
 
                     for selector in &style_rule.selectors {
-                        self.state_deps.note_selector(&selector.compound_selectors);
+                        self.state_deps.note_selector(&selector.complex_selector);
                         if selector.affects_siblings() {
                             self.sibling_affecting_selectors.push(selector.clone());
                         }
@@ -240,8 +229,7 @@ impl Stylist {
             if let Some(map) = self.pseudos_map.remove(&pseudo) {
                 let mut declarations = vec![];
 
-                map.user_agent.normal.get_universal_rules(&mut declarations);
-                map.user_agent.important.get_universal_rules(&mut declarations);
+                map.user_agent.get_universal_rules(&mut declarations);
 
                 self.precomputed_pseudo_element_decls.insert(pseudo, declarations);
             }
@@ -275,6 +263,7 @@ impl Stylist {
                                                   parent: &Arc<ComputedValues>)
                                                   -> Option<Arc<ComputedValues>>
         where E: Element<Impl=TheSelectorImpl> +
+              fmt::Debug +
               PresentationalHintsSynthetizer
     {
         debug_assert!(TheSelectorImpl::pseudo_element_cascade_type(pseudo).is_lazy());
@@ -290,7 +279,8 @@ impl Stylist {
                                           None,
                                           None,
                                           Some(pseudo),
-                                          &mut declarations);
+                                          &mut declarations,
+                                          MatchingReason::ForStyling);
 
         let (computed, _) =
             properties::cascade(self.device.au_viewport_size(),
@@ -339,12 +329,14 @@ impl Stylist {
                                         &self,
                                         element: &E,
                                         parent_bf: Option<&BloomFilter>,
-                                        style_attribute: Option<&PropertyDeclarationBlock>,
+                                        style_attribute: Option<&Arc<PropertyDeclarationBlock>>,
                                         pseudo_element: Option<&PseudoElement>,
-                                        applicable_declarations: &mut V) -> StyleRelations
+                                        applicable_declarations: &mut V,
+                                        reason: MatchingReason) -> StyleRelations
         where E: Element<Impl=TheSelectorImpl> +
+                 fmt::Debug +
                  PresentationalHintsSynthetizer,
-              V: Push<DeclarationBlock> + VecLike<DeclarationBlock>
+              V: Push<ApplicableDeclarationBlock> + VecLike<ApplicableDeclarationBlock>
     {
         assert!(!self.is_device_dirty);
         assert!(style_attribute.is_none() || pseudo_element.is_none(),
@@ -362,10 +354,12 @@ impl Stylist {
 
         debug!("Determining if style is shareable: pseudo: {}", pseudo_element.is_some());
         // Step 1: Normal user-agent rules.
-        map.user_agent.normal.get_all_matching_rules(element,
-                                                     parent_bf,
-                                                     applicable_declarations,
-                                                     &mut relations);
+        map.user_agent.get_all_matching_rules(element,
+                                              parent_bf,
+                                              applicable_declarations,
+                                              &mut relations,
+                                              reason,
+                                              Importance::Normal);
         debug!("UA normal: {:?}", relations);
 
         // Step 2: Presentational hints.
@@ -378,56 +372,71 @@ impl Stylist {
         debug!("preshints: {:?}", relations);
 
         // Step 3: User and author normal rules.
-        map.user.normal.get_all_matching_rules(element,
-                                               parent_bf,
-                                               applicable_declarations,
-                                               &mut relations);
+        map.user.get_all_matching_rules(element,
+                                        parent_bf,
+                                        applicable_declarations,
+                                        &mut relations,
+                                        reason,
+                                        Importance::Normal);
         debug!("user normal: {:?}", relations);
-        map.author.normal.get_all_matching_rules(element,
-                                                 parent_bf,
-                                                 applicable_declarations,
-                                                 &mut relations);
+        map.author.get_all_matching_rules(element,
+                                          parent_bf,
+                                          applicable_declarations,
+                                          &mut relations,
+                                          reason,
+                                          Importance::Normal);
         debug!("author normal: {:?}", relations);
 
         // Step 4: Normal style attributes.
-        if let Some(ref sa)  = style_attribute {
-            relations |= AFFECTED_BY_STYLE_ATTRIBUTE;
-            Push::push(
-                applicable_declarations,
-                GenericDeclarationBlock::from_declarations(sa.normal.clone()));
+        if let Some(sa)  = style_attribute {
+            if sa.any_normal() {
+                relations |= AFFECTED_BY_STYLE_ATTRIBUTE;
+                Push::push(
+                    applicable_declarations,
+                    ApplicableDeclarationBlock::from_declarations(sa.clone(), Importance::Normal));
+            }
         }
 
         debug!("style attr: {:?}", relations);
 
         // Step 5: Author-supplied `!important` rules.
-        map.author.important.get_all_matching_rules(element,
-                                                    parent_bf,
-                                                    applicable_declarations,
-                                                    &mut relations);
+        map.author.get_all_matching_rules(element,
+                                          parent_bf,
+                                          applicable_declarations,
+                                          &mut relations,
+                                          reason,
+                                          Importance::Important);
 
         debug!("author important: {:?}", relations);
 
         // Step 6: `!important` style attributes.
-        if let Some(ref sa) = style_attribute {
-            Push::push(
-                applicable_declarations,
-                GenericDeclarationBlock::from_declarations(sa.important.clone()));
+        if let Some(sa) = style_attribute {
+            if sa.any_important() {
+                relations |= AFFECTED_BY_STYLE_ATTRIBUTE;
+                Push::push(
+                    applicable_declarations,
+                    ApplicableDeclarationBlock::from_declarations(sa.clone(), Importance::Important));
+            }
         }
 
         debug!("style attr important: {:?}", relations);
 
         // Step 7: User and UA `!important` rules.
-        map.user.important.get_all_matching_rules(element,
-                                                  parent_bf,
-                                                  applicable_declarations,
-                                                  &mut relations);
+        map.user.get_all_matching_rules(element,
+                                        parent_bf,
+                                        applicable_declarations,
+                                        &mut relations,
+                                        reason,
+                                        Importance::Important);
 
         debug!("user important: {:?}", relations);
 
-        map.user_agent.important.get_all_matching_rules(element,
-                                                        parent_bf,
-                                                        applicable_declarations,
-                                                        &mut relations);
+        map.user_agent.get_all_matching_rules(element,
+                                              parent_bf,
+                                              applicable_declarations,
+                                              &mut relations,
+                                              reason,
+                                              Importance::Important);
 
         debug!("UA important: {:?}", relations);
 
@@ -442,7 +451,7 @@ impl Stylist {
     }
 
     #[inline]
-    pub fn animations(&self) -> &HashMap<Atom, KeyframesAnimation> {
+    pub fn animations(&self) -> &FnvHashMap<Atom, KeyframesAnimation> {
         &self.animations
     }
 
@@ -452,20 +461,23 @@ impl Stylist {
     where E: ElementExt
     {
         use selectors::matching::StyleRelations;
-        use selectors::matching::matches_compound_selector;
-        // XXX we can probably do better, the candidate should already know what
-        // rules it matches.
+        use selectors::matching::matches_complex_selector;
+        // TODO(emilio): we can probably do better, the candidate should already
+        // know what rules it matches. Also, we should only match until we find
+        // a descendant combinator, the rest should be ok, since the parent is
+        // the same.
         //
-        // XXX Could the bloom filter help here? Should be available.
+        // TODO(emilio): Use the bloom filter, since they contain the element's
+        // ancestor chain and it's correct for the candidate too.
         for ref selector in self.non_common_style_affecting_attributes_selectors.iter() {
-            let element_matches = matches_compound_selector(&selector.compound_selectors,
-                                                            element,
-                                                            None,
-                                                            &mut StyleRelations::empty());
-            let candidate_matches = matches_compound_selector(&selector.compound_selectors,
-                                                              candidate,
-                                                              None,
-                                                              &mut StyleRelations::empty());
+            let element_matches =
+                matches_complex_selector(&selector.complex_selector, element,
+                                         None, &mut StyleRelations::empty(),
+                                         MatchingReason::Other);
+            let candidate_matches =
+                matches_complex_selector(&selector.complex_selector, candidate,
+                                         None, &mut StyleRelations::empty(),
+                                         MatchingReason::Other);
 
             if element_matches != candidate_matches {
                 return false;
@@ -481,25 +493,26 @@ impl Stylist {
     where E: ElementExt
     {
         use selectors::matching::StyleRelations;
-        use selectors::matching::matches_compound_selector;
-        // XXX we can probably do better, the candidate should already know what
-        // rules it matches.
+        use selectors::matching::matches_complex_selector;
+        // TODO(emilio): we can probably do better, the candidate should already
+        // know what rules it matches.
         //
-        // XXX The bloom filter would help here, and should be available.
+        // TODO(emilio): Use the bloom filter, since they contain the element's
+        // ancestor chain and it's correct for the candidate too.
         for ref selector in self.sibling_affecting_selectors.iter() {
-            let element_matches = matches_compound_selector(&selector.compound_selectors,
-                                                            element,
-                                                            None,
-                                                            &mut StyleRelations::empty());
+            let element_matches =
+                matches_complex_selector(&selector.complex_selector, element,
+                                         None, &mut StyleRelations::empty(),
+                                         MatchingReason::Other);
 
-            let candidate_matches = matches_compound_selector(&selector.compound_selectors,
-                                                              candidate,
-                                                              None,
-                                                              &mut StyleRelations::empty());
+            let candidate_matches =
+                matches_complex_selector(&selector.complex_selector, candidate,
+                                         None, &mut StyleRelations::empty(),
+                                         MatchingReason::Other);
 
             if element_matches != candidate_matches {
                 debug!("match_same_sibling_affecting_rules: Failure due to {:?}",
-                       selector.compound_selectors);
+                       selector.complex_selector);
                 return false;
             }
         }
@@ -522,55 +535,393 @@ impl Stylist {
 }
 
 
-/// Map that contains the CSS rules for a given origin.
-#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-struct PerOriginSelectorMap {
-    /// Rules that contains at least one property declararion with
-    /// normal importance.
-    normal: SelectorMap<Vec<PropertyDeclaration>, TheSelectorImpl>,
-    /// Rules that contains at least one property declararion with
-    /// !important.
-    important: SelectorMap<Vec<PropertyDeclaration>, TheSelectorImpl>,
-}
-
-impl PerOriginSelectorMap {
-    #[inline]
-    fn new() -> Self {
-        PerOriginSelectorMap {
-            normal: SelectorMap::new(),
-            important: SelectorMap::new(),
-        }
-    }
-}
-
 /// Map that contains the CSS rules for a specific PseudoElement
 /// (or lack of PseudoElement).
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 struct PerPseudoElementSelectorMap {
     /// Rules from user agent stylesheets
-    user_agent: PerOriginSelectorMap,
+    user_agent: SelectorMap,
     /// Rules from author stylesheets
-    author: PerOriginSelectorMap,
+    author: SelectorMap,
     /// Rules from user stylesheets
-    user: PerOriginSelectorMap,
+    user: SelectorMap,
 }
 
 impl PerPseudoElementSelectorMap {
     #[inline]
     fn new() -> Self {
         PerPseudoElementSelectorMap {
-            user_agent: PerOriginSelectorMap::new(),
-            author: PerOriginSelectorMap::new(),
-            user: PerOriginSelectorMap::new(),
+            user_agent: SelectorMap::new(),
+            author: SelectorMap::new(),
+            user: SelectorMap::new(),
         }
     }
 
     #[inline]
-    fn borrow_for_origin(&mut self, origin: &Origin) -> &mut PerOriginSelectorMap {
+    fn borrow_for_origin(&mut self, origin: &Origin) -> &mut SelectorMap {
         match *origin {
             Origin::UserAgent => &mut self.user_agent,
             Origin::Author => &mut self.author,
             Origin::User => &mut self.user,
         }
     }
+}
+
+/// Map element data to Rules whose last simple selector starts with them.
+///
+/// e.g.,
+/// "p > img" would go into the set of Rules corresponding to the
+/// element "img"
+/// "a .foo .bar.baz" would go into the set of Rules corresponding to
+/// the class "bar"
+///
+/// Because we match Rules right-to-left (i.e., moving up the tree
+/// from an element), we need to compare the last simple selector in the
+/// Rule with the element.
+///
+/// So, if an element has ID "id1" and classes "foo" and "bar", then all
+/// the rules it matches will have their last simple selector starting
+/// either with "#id1" or with ".foo" or with ".bar".
+///
+/// Hence, the union of the rules keyed on each of element's classes, ID,
+/// element name, etc. will contain the Rules that actually match that
+/// element.
+#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+pub struct SelectorMap {
+    // TODO: Tune the initial capacity of the HashMap
+    pub id_hash: FnvHashMap<Atom, Vec<Rule>>,
+    pub class_hash: FnvHashMap<Atom, Vec<Rule>>,
+    pub local_name_hash: FnvHashMap<Atom, Vec<Rule>>,
+    /// Same as local_name_hash, but keys are lower-cased.
+    /// For HTML elements in HTML documents.
+    pub lower_local_name_hash: FnvHashMap<Atom, Vec<Rule>>,
+    /// Rules that don't have ID, class, or element selectors.
+    pub other_rules: Vec<Rule>,
+    /// Whether this hash is empty.
+    pub empty: bool,
+}
+
+#[inline]
+fn sort_by_key<T, F: Fn(&T) -> K, K: Ord>(v: &mut [T], f: F) {
+    sort_by(v, &|a, b| f(a).cmp(&f(b)))
+}
+
+impl SelectorMap {
+    pub fn new() -> Self {
+        SelectorMap {
+            id_hash: HashMap::default(),
+            class_hash: HashMap::default(),
+            local_name_hash: HashMap::default(),
+            lower_local_name_hash: HashMap::default(),
+            other_rules: Vec::new(),
+            empty: true,
+        }
+    }
+
+    /// Append to `rule_list` all Rules in `self` that match element.
+    ///
+    /// Extract matching rules as per element's ID, classes, tag name, etc..
+    /// Sort the Rules at the end to maintain cascading order.
+    pub fn get_all_matching_rules<E, V>(&self,
+                                        element: &E,
+                                        parent_bf: Option<&BloomFilter>,
+                                        matching_rules_list: &mut V,
+                                        relations: &mut StyleRelations,
+                                        reason: MatchingReason,
+                                        importance: Importance)
+        where E: Element<Impl=TheSelectorImpl>,
+              V: VecLike<ApplicableDeclarationBlock>
+    {
+        if self.empty {
+            return
+        }
+
+        // At the end, we're going to sort the rules that we added, so remember where we began.
+        let init_len = matching_rules_list.len();
+        if let Some(id) = element.get_id() {
+            SelectorMap::get_matching_rules_from_hash(element,
+                                                      parent_bf,
+                                                      &self.id_hash,
+                                                      &id,
+                                                      matching_rules_list,
+                                                      relations,
+                                                      reason,
+                                                      importance)
+        }
+
+        element.each_class(|class| {
+            SelectorMap::get_matching_rules_from_hash(element,
+                                                      parent_bf,
+                                                      &self.class_hash,
+                                                      class,
+                                                      matching_rules_list,
+                                                      relations,
+                                                      reason,
+                                                      importance);
+        });
+
+        let local_name_hash = if element.is_html_element_in_html_document() {
+            &self.lower_local_name_hash
+        } else {
+            &self.local_name_hash
+        };
+        SelectorMap::get_matching_rules_from_hash(element,
+                                                  parent_bf,
+                                                  local_name_hash,
+                                                  element.get_local_name(),
+                                                  matching_rules_list,
+                                                  relations,
+                                                  reason,
+                                                  importance);
+
+        SelectorMap::get_matching_rules(element,
+                                        parent_bf,
+                                        &self.other_rules,
+                                        matching_rules_list,
+                                        relations,
+                                        reason,
+                                        importance);
+
+        // Sort only the rules we just added.
+        sort_by_key(&mut matching_rules_list[init_len..],
+                    |rule| (rule.specificity, rule.source_order));
+    }
+
+    /// Append to `rule_list` all universal Rules (rules with selector `*|*`) in
+    /// `self` sorted by specifity and source order.
+    pub fn get_universal_rules<V>(&self,
+                                  matching_rules_list: &mut V)
+        where V: VecLike<ApplicableDeclarationBlock>
+    {
+        if self.empty {
+            return
+        }
+
+        let init_len = matching_rules_list.len();
+
+        for rule in self.other_rules.iter() {
+            if rule.selector.compound_selector.is_empty() &&
+               rule.selector.next.is_none() {
+                if rule.declarations.any_normal() {
+                    matching_rules_list.push(
+                        rule.to_applicable_declaration_block(Importance::Normal));
+                }
+                if rule.declarations.any_important() {
+                    matching_rules_list.push(
+                        rule.to_applicable_declaration_block(Importance::Important));
+                }
+            }
+        }
+
+        sort_by_key(&mut matching_rules_list[init_len..],
+                    |rule| (rule.specificity, rule.source_order));
+    }
+
+    fn get_matching_rules_from_hash<E, Str, BorrowedStr: ?Sized, Vector>(
+        element: &E,
+        parent_bf: Option<&BloomFilter>,
+        hash: &FnvHashMap<Str, Vec<Rule>>,
+        key: &BorrowedStr,
+        matching_rules: &mut Vector,
+        relations: &mut StyleRelations,
+        reason: MatchingReason,
+        importance: Importance)
+        where E: Element<Impl=TheSelectorImpl>,
+              Str: Borrow<BorrowedStr> + Eq + Hash,
+              BorrowedStr: Eq + Hash,
+              Vector: VecLike<ApplicableDeclarationBlock>
+    {
+        if let Some(rules) = hash.get(key) {
+            SelectorMap::get_matching_rules(element,
+                                            parent_bf,
+                                            rules,
+                                            matching_rules,
+                                            relations,
+                                            reason,
+                                            importance)
+        }
+    }
+
+    /// Adds rules in `rules` that match `element` to the `matching_rules` list.
+    fn get_matching_rules<E, V>(element: &E,
+                                parent_bf: Option<&BloomFilter>,
+                                rules: &[Rule],
+                                matching_rules: &mut V,
+                                relations: &mut StyleRelations,
+                                reason: MatchingReason,
+                                importance: Importance)
+        where E: Element<Impl=TheSelectorImpl>,
+              V: VecLike<ApplicableDeclarationBlock>
+    {
+        for rule in rules.iter() {
+            let block = &rule.declarations;
+            let any_declaration_for_importance = if importance.important() {
+                block.any_important()
+            } else {
+                block.any_normal()
+            };
+            if any_declaration_for_importance &&
+               matches_complex_selector(&*rule.selector, element, parent_bf,
+                                        relations, reason) {
+                matching_rules.push(rule.to_applicable_declaration_block(importance));
+            }
+        }
+    }
+
+    /// Insert rule into the correct hash.
+    /// Order in which to try: id_hash, class_hash, local_name_hash, other_rules.
+    pub fn insert(&mut self, rule: Rule) {
+        self.empty = false;
+
+        if let Some(id_name) = SelectorMap::get_id_name(&rule) {
+            find_push(&mut self.id_hash, id_name, rule);
+            return;
+        }
+
+        if let Some(class_name) = SelectorMap::get_class_name(&rule) {
+            find_push(&mut self.class_hash, class_name, rule);
+            return;
+        }
+
+        if let Some(LocalName { name, lower_name }) = SelectorMap::get_local_name(&rule) {
+            find_push(&mut self.local_name_hash, name, rule.clone());
+            find_push(&mut self.lower_local_name_hash, lower_name, rule);
+            return;
+        }
+
+        self.other_rules.push(rule);
+    }
+
+    /// Retrieve the first ID name in Rule, or None otherwise.
+    pub fn get_id_name(rule: &Rule) -> Option<Atom> {
+        for ss in &rule.selector.compound_selector {
+            // TODO(pradeep): Implement case-sensitivity based on the
+            // document type and quirks mode.
+            if let SimpleSelector::ID(ref id) = *ss {
+                return Some(id.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Retrieve the FIRST class name in Rule, or None otherwise.
+    pub fn get_class_name(rule: &Rule) -> Option<Atom> {
+        for ss in &rule.selector.compound_selector {
+            // TODO(pradeep): Implement case-sensitivity based on the
+            // document type and quirks mode.
+            if let SimpleSelector::Class(ref class) = *ss {
+                return Some(class.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Retrieve the name if it is a type selector, or None otherwise.
+    pub fn get_local_name(rule: &Rule) -> Option<LocalName<TheSelectorImpl>> {
+        for ss in &rule.selector.compound_selector {
+            if let SimpleSelector::LocalName(ref n) = *ss {
+                return Some(LocalName {
+                    name: n.name.clone(),
+                    lower_name: n.lower_name.clone(),
+                })
+            }
+        }
+
+        None
+    }
+}
+
+#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+#[derive(Clone)]
+pub struct Rule {
+    // This is an Arc because Rule will essentially be cloned for every element
+    // that it matches. Selector contains an owned vector (through
+    // ComplexSelector) and we want to avoid the allocation.
+    pub selector: Arc<ComplexSelector<TheSelectorImpl>>,
+    pub declarations: Arc<PropertyDeclarationBlock>,
+    pub source_order: usize,
+    pub specificity: u32,
+}
+
+impl Rule {
+    fn to_applicable_declaration_block(&self, importance: Importance)
+                                       -> ApplicableDeclarationBlock {
+        ApplicableDeclarationBlock {
+            mixed_declarations: self.declarations.clone(),
+            importance: importance,
+            source_order: self.source_order,
+            specificity: self.specificity,
+        }
+    }
+}
+
+/// A property declaration together with its precedence among rules of equal specificity so that
+/// we can sort them.
+#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+#[derive(Debug, Clone)]
+pub struct ApplicableDeclarationBlock {
+    /// Contains declarations of either importance, but only those of self.importance are relevant.
+    /// Use ApplicableDeclarationBlock::iter
+    pub mixed_declarations: Arc<PropertyDeclarationBlock>,
+    pub importance: Importance,
+    pub source_order: usize,
+    pub specificity: u32,
+}
+
+impl ApplicableDeclarationBlock {
+    #[inline]
+    pub fn from_declarations(declarations: Arc<PropertyDeclarationBlock>,
+                             importance: Importance)
+                             -> Self {
+        ApplicableDeclarationBlock {
+            mixed_declarations: declarations,
+            importance: importance,
+            source_order: 0,
+            specificity: 0,
+        }
+    }
+
+    pub fn iter(&self) -> ApplicableDeclarationBlockIter {
+        ApplicableDeclarationBlockIter {
+            iter: self.mixed_declarations.declarations.iter(),
+            importance: self.importance,
+        }
+    }
+}
+
+pub struct ApplicableDeclarationBlockIter<'a> {
+    iter: slice::Iter<'a, (PropertyDeclaration, Importance)>,
+    importance: Importance,
+}
+
+impl<'a> Iterator for ApplicableDeclarationBlockIter<'a> {
+    type Item = &'a PropertyDeclaration;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(&(ref declaration, importance)) = self.iter.next() {
+            if importance == self.importance {
+                return Some(declaration)
+            }
+        }
+        None
+    }
+}
+
+impl<'a> DoubleEndedIterator for ApplicableDeclarationBlockIter<'a> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while let Some(&(ref declaration, importance)) = self.iter.next_back() {
+            if importance == self.importance {
+                return Some(declaration)
+            }
+        }
+        None
+    }
+}
+
+fn find_push<Str: Eq + Hash>(map: &mut FnvHashMap<Str, Vec<Rule>>, key: Str, value: Rule) {
+    map.entry(key).or_insert_with(Vec::new).push(value)
 }

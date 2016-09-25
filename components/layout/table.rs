@@ -9,7 +9,7 @@
 use app_units::Au;
 use block::{BlockFlow, CandidateBSizeIterator, ISizeAndMarginsComputer};
 use block::{ISizeConstraintInput, ISizeConstraintSolution};
-use context::LayoutContext;
+use context::{LayoutContext, SharedLayoutContext};
 use display_list_builder::{BlockFlowDisplayListBuilding, BorderPaintingMode, DisplayListBuildState};
 use euclid::Point2D;
 use flow;
@@ -31,8 +31,8 @@ use style::logical_geometry::LogicalSize;
 use style::properties::ServoComputedValues;
 use style::values::CSSFloat;
 use style::values::computed::LengthOrPercentageOrAuto;
-use table_row::TableRowFlow;
 use table_row::{self, CellIntrinsicInlineSize, CollapsedBorder, CollapsedBorderProvenance};
+use table_row::TableRowFlow;
 use table_wrapper::TableLayout;
 
 /// A table flow corresponded to the table's internal table fragment under a table wrapper flow.
@@ -311,11 +311,12 @@ impl Flow for TableFlow {
                         &mut self.collapsed_block_direction_border_widths_for_table);
                     previous_collapsed_block_end_borders =
                         PreviousBlockCollapsedBorders::FromPreviousRow(
-                            row.final_collapsed_borders.block_end.clone())
+                            row.final_collapsed_borders.block_end.clone());
                 }
                 first_row = false
-            }
+            };
         }
+
 
         computation.surrounding_size = computation.surrounding_size +
                                        self.total_horizontal_spacing();
@@ -334,13 +335,17 @@ impl Flow for TableFlow {
         let containing_block_inline_size = self.block_flow.base.block_container_inline_size;
 
         let mut num_unspecified_inline_sizes = 0;
+        let mut num_percentage_inline_sizes = 0;
         let mut total_column_inline_size = Au(0);
+        let mut total_column_percentage_size = 0.0;
         for column_inline_size in &self.column_intrinsic_inline_sizes {
-            if column_inline_size.constrained {
-                total_column_inline_size = total_column_inline_size +
-                    column_inline_size.minimum_length
+            if column_inline_size.percentage != 0.0 {
+                total_column_percentage_size += column_inline_size.percentage;
+                num_percentage_inline_sizes += 1;
+            } else if column_inline_size.constrained {
+                total_column_inline_size += column_inline_size.minimum_length;
             } else {
-                num_unspecified_inline_sizes += 1
+                num_unspecified_inline_sizes += 1;
             }
         }
 
@@ -363,20 +368,12 @@ impl Flow for TableFlow {
             TableLayout::Fixed => {
                 // In fixed table layout, we distribute extra space among the unspecified columns
                 // if there are any, or among all the columns if all are specified.
+                // See: https://drafts.csswg.org/css-tables-3/#distributing-width-to-columns (infobox)
                 self.column_computed_inline_sizes.clear();
-                if num_unspecified_inline_sizes == 0 {
-                    let ratio = content_inline_size.to_f32_px() /
-                        total_column_inline_size.to_f32_px();
-                    for column_inline_size in &self.column_intrinsic_inline_sizes {
-                        self.column_computed_inline_sizes.push(ColumnComputedInlineSize {
-                            size: column_inline_size.minimum_length.scale_by(ratio),
-                        });
-                    }
-                } else if num_unspecified_inline_sizes != 0 {
+                if num_unspecified_inline_sizes != 0 {
                     let extra_column_inline_size = content_inline_size - total_column_inline_size;
                     for column_inline_size in &self.column_intrinsic_inline_sizes {
-                        if !column_inline_size.constrained &&
-                                column_inline_size.percentage == 0.0 {
+                        if !column_inline_size.constrained {
                             self.column_computed_inline_sizes.push(ColumnComputedInlineSize {
                                 size: extra_column_inline_size / num_unspecified_inline_sizes,
                             });
@@ -385,6 +382,23 @@ impl Flow for TableFlow {
                                 size: column_inline_size.minimum_length,
                             });
                         }
+                    }
+                } else if num_percentage_inline_sizes != 0 {
+                    let extra_column_inline_size = content_inline_size - total_column_inline_size;
+                    let ratio = content_inline_size.to_f32_px() /
+                        total_column_percentage_size;
+                    for column_inline_size in &self.column_intrinsic_inline_sizes {
+                        self.column_computed_inline_sizes.push(ColumnComputedInlineSize {
+                            size: extra_column_inline_size.scale_by(ratio * column_inline_size.percentage),
+                        });
+                    }
+                } else {
+                    let ratio = content_inline_size.to_f32_px() /
+                        total_column_inline_size.to_f32_px();
+                    for column_inline_size in &self.column_intrinsic_inline_sizes {
+                        self.column_computed_inline_sizes.push(ColumnComputedInlineSize {
+                            size: column_inline_size.minimum_length.scale_by(ratio),
+                        });
                     }
                 }
             }
@@ -425,7 +439,7 @@ impl Flow for TableFlow {
                     collapsed_inline_direction_border_widths_for_table,
                     &mut collapsed_block_direction_border_widths_for_table);
             }
-        })
+        });
     }
 
     fn assign_block_size<'a>(&mut self, _: &'a LayoutContext<'a>) {
@@ -434,7 +448,7 @@ impl Flow for TableFlow {
         self.block_flow.assign_block_size_for_table_like_flow(vertical_spacing)
     }
 
-    fn compute_absolute_position(&mut self, layout_context: &LayoutContext) {
+    fn compute_absolute_position(&mut self, layout_context: &SharedLayoutContext) {
         self.block_flow.compute_absolute_position(layout_context)
     }
 
@@ -589,7 +603,7 @@ impl ColumnIntrinsicInlineSize {
 ///
 /// TODO(pcwalton): There will probably be some `border-collapse`-related info in here too
 /// eventually.
-#[derive(RustcEncodable, Clone, Copy)]
+#[derive(RustcEncodable, Clone, Copy, Debug)]
 pub struct ColumnComputedInlineSize {
     /// The computed size of this inline column.
     pub size: Au,
@@ -629,27 +643,21 @@ fn perform_border_collapse_for_row(child_table_row: &mut TableRowFlow,
                                    next_block_borders: NextBlockCollapsedBorders,
                                    inline_spacing: &mut Vec<Au>,
                                    block_spacing: &mut Vec<Au>) {
+    let number_of_borders_inline_direction = child_table_row.preliminary_collapsed_borders.inline.len();
     // Compute interior inline borders.
     for (i, this_inline_border) in child_table_row.preliminary_collapsed_borders
                                                   .inline
-                                                  .iter()
+                                                  .iter_mut()
                                                   .enumerate() {
         child_table_row.final_collapsed_borders.inline.push_or_set(i, *this_inline_border);
+        if i == 0 {
+            child_table_row.final_collapsed_borders.inline[i].combine(&table_inline_borders.start);
+        } else if i + 1 == number_of_borders_inline_direction {
+            child_table_row.final_collapsed_borders.inline[i].combine(&table_inline_borders.end);
+        }
 
         let inline_spacing = inline_spacing.get_mut_or_push(i, Au(0));
-        *inline_spacing = cmp::max(*inline_spacing, this_inline_border.width)
-    }
-
-    // Collapse edge interior borders with the table.
-    if let Some(ref mut first_inline_borders) = child_table_row.final_collapsed_borders
-                                                               .inline
-                                                               .get_mut(0) {
-        first_inline_borders.combine(&table_inline_borders.start)
-    }
-    if let Some(ref mut last_inline_borders) = child_table_row.final_collapsed_borders
-                                                              .inline
-                                                              .last_mut() {
-        last_inline_borders.combine(&table_inline_borders.end)
+        *inline_spacing = cmp::max(*inline_spacing, child_table_row.final_collapsed_borders.inline[i].width)
     }
 
     // Compute block-start borders.
@@ -777,6 +785,7 @@ impl TableLikeFlow for BlockFlow {
 }
 
 /// Inline collapsed borders for the table itself.
+#[derive(Debug)]
 struct TableInlineCollapsedBorders {
     /// The table border at the start of the inline direction.
     start: CollapsedBorder,

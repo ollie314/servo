@@ -31,20 +31,20 @@ pub struct HTMLMetaElement {
 }
 
 impl HTMLMetaElement {
-    fn new_inherited(localName: Atom,
+    fn new_inherited(local_name: Atom,
                      prefix: Option<DOMString>,
                      document: &Document) -> HTMLMetaElement {
         HTMLMetaElement {
-            htmlelement: HTMLElement::new_inherited(localName, prefix, document),
+            htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             stylesheet: DOMRefCell::new(None),
         }
     }
 
     #[allow(unrooted_must_root)]
-    pub fn new(localName: Atom,
+    pub fn new(local_name: Atom,
                prefix: Option<DOMString>,
                document: &Document) -> Root<HTMLMetaElement> {
-        Node::reflect_node(box HTMLMetaElement::new_inherited(localName, prefix, document),
+        Node::reflect_node(box HTMLMetaElement::new_inherited(local_name, prefix, document),
                            document,
                            HTMLMetaElementBinding::Wrap)
     }
@@ -79,7 +79,7 @@ impl HTMLMetaElement {
             if !content.is_empty() {
                 if let Some(translated_rule) = ViewportRule::from_meta(&**content) {
                     *self.stylesheet.borrow_mut() = Some(Arc::new(Stylesheet {
-                        rules: vec![CSSRule::Viewport(translated_rule)],
+                        rules: vec![CSSRule::Viewport(Arc::new(translated_rule))],
                         origin: Origin::Author,
                         media: None,
                         // Viewport constraints are always recomputed on resize; they don't need to

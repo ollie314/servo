@@ -15,7 +15,6 @@ extern crate selectors;
 extern crate style;
 extern crate style_traits;
 extern crate url;
-extern crate util;
 
 mod context;
 mod data;
@@ -23,7 +22,6 @@ mod snapshot;
 mod snapshot_helpers;
 #[allow(non_snake_case)]
 pub mod glue;
-mod sanity_checks;
 mod traversal;
 mod wrapper;
 

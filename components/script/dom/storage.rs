@@ -136,10 +136,8 @@ impl StorageMethods for Storage {
     }
 
     // check-tidy: no specs after this line
-    fn NamedGetter(&self, name: DOMString, found: &mut bool) -> Option<DOMString> {
-        let item = self.GetItem(name);
-        *found = item.is_some();
-        item
+    fn NamedGetter(&self, name: DOMString) -> Option<DOMString> {
+        self.GetItem(name)
     }
 
     fn NamedSetter(&self, name: DOMString, value: DOMString) -> ErrorResult {
@@ -208,7 +206,7 @@ impl Runnable for StorageEventRunnable {
             assert!(UrlHelper::SameOrigin(&ev_url, &it_window.get_url()));
             // TODO: Such a Document object is not necessarily fully active, but events fired on such
             // objects are ignored by the event loop until the Document becomes fully active again.
-            if ev_window.pipeline() != it_window.pipeline() {
+            if ev_window.pipeline_id() != it_window.pipeline_id() {
                 storage_event.upcast::<Event>().fire(it_window.upcast());
             }
         }

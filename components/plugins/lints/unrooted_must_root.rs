@@ -7,7 +7,6 @@ use rustc::hir::intravisit as visit;
 use rustc::hir::map as ast_map;
 use rustc::lint::{LateContext, LintPass, LintArray, LateLintPass, LintContext};
 use rustc::ty;
-use syntax::attr::AttrMetaMethods;
 use syntax::{ast, codemap};
 use utils::{match_def_path, in_derive_expn};
 
@@ -44,8 +43,7 @@ fn is_unrooted_ty(cx: &LateContext, ty: &ty::TyS, in_new_function: bool) -> bool
     let mut ret = false;
     ty.maybe_walk(|t| {
         match t.sty {
-            ty::TyStruct(did, _) |
-            ty::TyEnum(did, _) => {
+            ty::TyAdt(did, _) => {
                 if cx.tcx.has_attr(did.did, "must_root") {
                     ret = true;
                     false
@@ -53,6 +51,8 @@ fn is_unrooted_ty(cx: &LateContext, ty: &ty::TyS, in_new_function: bool) -> bool
                     false
                 } else if match_def_path(cx, did.did, &["core", "cell", "Ref"])
                         || match_def_path(cx, did.did, &["core", "cell", "RefMut"])
+                        || match_def_path(cx, did.did, &["style", "refcell", "Ref"])
+                        || match_def_path(cx, did.did, &["style", "refcell", "RefMut"])
                         || match_def_path(cx, did.did, &["core", "slice", "Iter"])
                         || match_def_path(cx, did.did, &["std", "collections", "hash", "map", "OccupiedEntry"])
                         || match_def_path(cx, did.did, &["std", "collections", "hash", "map", "VacantEntry"]) {
@@ -139,10 +139,8 @@ impl LateLintPass for UnrootedPass {
             }
 
             if !in_new_function {
-                if let ty::FnOutput::FnConverging(ret) = ty.fn_ret().0 {
-                    if is_unrooted_ty(cx, ret, false) {
-                        cx.span_lint(UNROOTED_MUST_ROOT, decl.output.span(), "Type must be rooted")
-                    }
+                if is_unrooted_ty(cx, ty.fn_ret().0, false) {
+                    cx.span_lint(UNROOTED_MUST_ROOT, decl.output.span(), "Type must be rooted")
                 }
             }
         }

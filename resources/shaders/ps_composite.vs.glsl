@@ -3,35 +3,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-struct Composite {
-    uvec4 src0;
-    uvec4 src1;
-    uvec4 target_rect;
-    ivec4 info;
-    vec4 amount;
-};
-
-layout(std140) uniform Items {
-    Composite composites[WR_MAX_PRIM_ITEMS];
-};
-
 void main(void) {
-    Composite composite = composites[gl_InstanceID];
+    Composite composite = fetch_composite(gl_InstanceID);
+    Tile src0 = fetch_tile(int(composite.src0_src1_target_id.x));
+    Tile src1 = fetch_tile(int(composite.src0_src1_target_id.y));
+    Tile dest = fetch_tile(int(composite.src0_src1_target_id.z));
 
-    vec2 local_pos = mix(vec2(composite.target_rect.xy),
-                         vec2(composite.target_rect.xy + composite.target_rect.zw),
+    vec2 local_pos = mix(vec2(dest.target_rect.xy),
+                         vec2(dest.target_rect.xy + dest.target_rect.zw),
                          aPosition.xy);
 
-    vec2 st0 = vec2(composite.src0.xy) / 2048.0;
-    vec2 st1 = vec2(composite.src0.xy + composite.src0.zw) / 2048.0;
+    vec2 st0 = vec2(src0.target_rect.xy) / 2048.0;
+    vec2 st1 = vec2(src0.target_rect.xy + src0.target_rect.zw) / 2048.0;
     vUv0 = mix(st0, st1, aPosition.xy);
 
-    st0 = vec2(composite.src1.xy) / 2048.0;
-    st1 = vec2(composite.src1.xy + composite.src1.zw) / 2048.0;
+    st0 = vec2(src1.target_rect.xy) / 2048.0;
+    st1 = vec2(src1.target_rect.xy + src1.target_rect.zw) / 2048.0;
     vUv1 = mix(st0, st1, aPosition.xy);
 
-    vInfo = composite.info.xy;
-    vAmount = composite.amount.x;
+    vInfo = ivec2(composite.info_amount.xy);
+    vAmount = composite.info_amount.z;
 
     gl_Position = uTransform * vec4(local_pos, 0, 1);
 }

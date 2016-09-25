@@ -23,6 +23,13 @@ class CheckTidiness(unittest.TestCase):
         with self.assertRaises(StopIteration):
             errors.next()
 
+    def test_tidy_config(self):
+        errors = tidy.check_config_file(os.path.join(base_path, 'servo-tidy.toml'), print_text=False)
+        self.assertEqual("invalid config key 'key-outside'", errors.next()[2])
+        self.assertEqual("invalid config key 'wrong-key'", errors.next()[2])
+        self.assertEqual('invalid config table [wrong]', errors.next()[2])
+        self.assertNoMoreErrors(errors)
+
     def test_spaces_correctnes(self):
         errors = tidy.collect_errors_for_files(iterFile('wrong_space.rs'), [], [tidy.check_by_line], print_text=False)
         self.assertEqual('trailing whitespace', errors.next()[2])
@@ -30,6 +37,11 @@ class CheckTidiness(unittest.TestCase):
         self.assertEqual('tab on line', errors.next()[2])
         self.assertEqual('CR on line', errors.next()[2])
         self.assertEqual('no newline at EOF', errors.next()[2])
+        self.assertNoMoreErrors(errors)
+
+    def test_empty_file(self):
+        errors = tidy.collect_errors_for_files(iterFile('empty_file.rs'), [], [tidy.check_by_line], print_text=False)
+        self.assertEqual('file is empty', errors.next()[2])
         self.assertNoMoreErrors(errors)
 
     def test_long_line(self):
@@ -73,6 +85,7 @@ class CheckTidiness(unittest.TestCase):
         self.assertEqual('missing space before }', errors.next()[2])
         self.assertTrue('use statement is not in alphabetical order' in errors.next()[2])
         self.assertEqual('use statement contains braces for single import', errors.next()[2])
+        self.assertTrue('use statement is not in alphabetical order' in errors.next()[2])
         self.assertEqual('encountered whitespace following a use statement', errors.next()[2])
         self.assertTrue('mod declaration is not in alphabetical order' in errors.next()[2])
         self.assertEqual('mod declaration spans multiple lines', errors.next()[2])
@@ -96,6 +109,9 @@ class CheckTidiness(unittest.TestCase):
         self.assertEqual('use &T instead of &Root<T>', errors.next()[2])
         self.assertEqual('operators should go at the end of the first line', errors.next()[2])
         self.assertEqual('else braces should be on the same line', errors.next()[2])
+        self.assertEqual('extra space after (', errors.next()[2])
+        self.assertEqual('extra space after (', errors.next()[2])
+        self.assertEqual('extra space after (', errors.next()[2])
         self.assertNoMoreErrors(errors)
 
     def test_spec_link(self):
@@ -110,7 +126,7 @@ class CheckTidiness(unittest.TestCase):
         self.assertNoMoreErrors(errors)
 
     def test_toml(self):
-        errors = tidy.collect_errors_for_files(iterFile('test.toml'), [tidy.check_toml], [], print_text=False)
+        errors = tidy.collect_errors_for_files(iterFile('Cargo.toml'), [tidy.check_toml], [], print_text=False)
         self.assertEqual('found asterisk instead of minimum version number', errors.next()[2])
         self.assertEqual('.toml file should contain a valid license.', errors.next()[2])
         self.assertNoMoreErrors(errors)

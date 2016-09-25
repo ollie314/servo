@@ -27,7 +27,6 @@ extern crate time;
 extern crate url;
 
 use hyper::header::Headers;
-use hyper::http::RawStatus;
 use hyper::method::Method;
 use ipc_channel::ipc::IpcSender;
 use msg::constellation_msg::PipelineId;
@@ -252,7 +251,7 @@ bitflags! {
 
 #[derive(Deserialize, Serialize)]
 pub struct PageError {
-    #[serde(rename = "type")]
+    #[serde(rename = "_type")]
     pub type_: String,
     pub errorMessage: String,
     pub sourceName: String,
@@ -270,7 +269,7 @@ pub struct PageError {
 
 #[derive(Deserialize, Serialize)]
 pub struct ConsoleAPI {
-    #[serde(rename = "type")]
+    #[serde(rename = "_type")]
     pub type_: String,
     pub level: String,
     pub filename: String,
@@ -304,7 +303,7 @@ pub struct HttpRequest {
 #[derive(Debug, PartialEq)]
 pub struct HttpResponse {
     pub headers: Option<Headers>,
-    pub status: Option<RawStatus>,
+    pub status: Option<(u16, Vec<u8>)>,
     pub body: Option<Vec<u8>>,
     pub pipeline_id: PipelineId,
 }

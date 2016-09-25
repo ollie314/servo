@@ -70,6 +70,14 @@
                     computed_value::T(Some(l.to_computed_value(context)))
             }
         }
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            match *computed {
+                computed_value::T(None) => SpecifiedValue::Auto,
+                computed_value::T(Some(l)) =>
+                    SpecifiedValue::Specified(ToComputedValue::from_computed_value(&l))
+            }
+        }
     }
 
     pub fn parse(_context: &ParserContext, input: &mut Parser) -> Result<SpecifiedValue, ()> {
@@ -136,6 +144,15 @@
                     computed_value::T(Some(count))
             }
         }
+
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            match *computed {
+                computed_value::T(None) => SpecifiedValue::Auto,
+                computed_value::T(Some(count)) =>
+                    SpecifiedValue::Specified(count)
+            }
+        }
     }
 
     pub fn parse(_context: &ParserContext, input: &mut Parser) -> Result<SpecifiedValue, ()> {
@@ -153,7 +170,7 @@
 </%helpers:longhand>
 
 // FIXME: This prop should be animatable.
-<%helpers:longhand name="column-gap" experimental="True" animatable="False">
+<%helpers:longhand name="column-gap" experimental="True" products="servo" animatable="False">
     use cssparser::ToCss;
     use std::fmt;
     use values::LocalToCss;
@@ -214,6 +231,14 @@
                 SpecifiedValue::Normal => computed_value::T(None),
                 SpecifiedValue::Specified(l) =>
                     computed_value::T(Some(l.to_computed_value(context)))
+            }
+        }
+        #[inline]
+        fn from_computed_value(computed: &computed_value::T) -> Self {
+            match *computed {
+                computed_value::T(None) => SpecifiedValue::Normal,
+                computed_value::T(Some(l)) =>
+                    SpecifiedValue::Specified(ToComputedValue::from_computed_value(&l))
             }
         }
     }
