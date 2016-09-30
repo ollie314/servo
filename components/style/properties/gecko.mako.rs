@@ -1118,7 +1118,6 @@ fn static_assert() {
         use gecko_bindings::structs::nsStyleImageLayers_Size_DimensionType;
         use gecko_bindings::structs::{nsStyleCoord_CalcValue, nsStyleImageLayers_Size};
         use properties::longhands::background_size::single_value::computed_value::T;
-        use values::computed::LengthOrPercentageOrAuto;
 
         let mut width = nsStyleCoord_CalcValue::new();
         let mut height = nsStyleCoord_CalcValue::new();
@@ -1440,6 +1439,22 @@ fn static_assert() {
         }).collect();
         longhands::box_shadow::computed_value::T(buf)
     }
+</%self:impl_trait>
+
+
+<%self:impl_trait style_struct_name="InheritedTable"
+                  skip_longhands="border-spacing">
+
+    pub fn set_border_spacing(&mut self, v: longhands::border_spacing::computed_value::T) {
+        self.gecko.mBorderSpacingCol = v.horizontal.0;
+        self.gecko.mBorderSpacingRow = v.vertical.0;
+    }
+
+    pub fn copy_border_spacing_from(&mut self, other: &Self) {
+        self.gecko.mBorderSpacingCol = other.gecko.mBorderSpacingCol;
+        self.gecko.mBorderSpacingRow = other.gecko.mBorderSpacingRow;
+    }
+
 </%self:impl_trait>
 
 
