@@ -32,6 +32,7 @@ use gecko_bindings::structs::{nsChangeHint, nsIAtom, nsIContent, nsStyleContext}
 use gecko_bindings::structs::OpaqueStyleData;
 use gecko_bindings::sugar::ownership::{FFIArcHelpers, HasArcFFI, HasFFI};
 use libc::uintptr_t;
+use parking_lot::RwLock;
 use parser::ParserContextExtraData;
 use properties::{ComputedValues, parse_style_attribute};
 use properties::PropertyDeclarationBlock;
@@ -58,7 +59,7 @@ impl NonOpaqueStyleData {
 
 
 pub struct GeckoDeclarationBlock {
-    pub declarations: Option<Arc<PropertyDeclarationBlock>>,
+    pub declarations: Option<Arc<RwLock<PropertyDeclarationBlock>>>,
     // XXX The following two fields are made atomic to work around the
     // ownership system so that they can be changed inside a shared
     // instance. It wouldn't provide safety as Rust usually promises,
@@ -155,7 +156,7 @@ impl TRestyleDamage for GeckoRestyleDamage {
     fn compute(source: &nsStyleContext,
                new_style: &Arc<ComputedValues>) -> Self {
         let context = source as *const nsStyleContext as *mut nsStyleContext;
-        let hint = unsafe { Gecko_CalcStyleDifference(context, new_style.as_borrowed()) };
+        let hint = unsafe { Gecko_CalcStyleDifference(context, new_style.as_borrowed_opt().unwrap()) };
         GeckoRestyleDamage(hint)
     }
 
@@ -329,7 +330,7 @@ impl<'ln> TNode for GeckoNode<'ln> {
     }
 
     fn last_child(&self) -> Option<GeckoNode<'ln>> {
-        unsafe { Gecko_GetLastChild(self.0).borrow_opt().map(GeckoNode) }
+        unsafe { Gecko_GetLastChild(self.0).map(GeckoNode) }
     }
 
     fn prev_sibling(&self) -> Option<GeckoNode<'ln>> {
@@ -397,7 +398,7 @@ impl<'a> Iterator for GeckoChildrenIterator<'a> {
                 curr
             },
             GeckoChildrenIterator::GeckoIterator(ref it) => unsafe {
-                Gecko_GetNextStyleChild(&it).borrow_opt().map(GeckoNode)
+                Gecko_GetNextStyleChild(&it).map(GeckoNode)
             }
         }
     }
@@ -416,7 +417,7 @@ impl<'ld> TDocument for GeckoDocument<'ld> {
 
     fn root_node(&self) -> Option<GeckoNode<'ld>> {
         unsafe {
-            Gecko_GetDocumentElement(self.0).borrow_opt().map(|el| GeckoElement(el).as_node())
+            Gecko_GetDocumentElement(self.0).map(|el| GeckoElement(el).as_node())
         }
     }
 
@@ -468,12 +469,12 @@ impl<'le> TElement for GeckoElement<'le> {
         unsafe { GeckoNode(&*(self.0 as *const _ as *const RawGeckoNode)) }
     }
 
-    fn style_attribute(&self) -> Option<&Arc<PropertyDeclarationBlock>> {
+    fn style_attribute(&self) -> Option<&Arc<RwLock<PropertyDeclarationBlock>>> {
         let declarations = unsafe { Gecko_GetServoDeclarationBlock(self.0) };
-        if declarations.is_null() {
+        if declarations.is_none() {
             None
         } else {
-            let declarations = declarations.as_arc::<GeckoDeclarationBlock>();
+            let declarations = GeckoDeclarationBlock::arc_from_borrowed(&declarations).unwrap();
             declarations.declarations.as_ref().map(|r| r as *const Arc<_>).map(|ptr| unsafe { &*ptr })
         }
     }

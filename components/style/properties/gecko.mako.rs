@@ -27,6 +27,7 @@ use gecko_bindings::bindings::{Gecko_FontFamilyList_Clear, Gecko_InitializeImage
 use gecko_bindings::bindings::ServoComputedValuesBorrowedOrNull;
 use gecko_bindings::structs;
 use gecko_bindings::sugar::ns_style_coord::{CoordDataValue, CoordData, CoordDataMut};
+use gecko_bindings::sugar::ownership::HasArcFFI;
 use gecko::values::{StyleCoordHelpers, GeckoStyleCoordConvertible, convert_nscolor_to_rgba};
 use gecko::values::convert_rgba_to_nscolor;
 use gecko::values::round_border_to_device_pixels;
@@ -447,7 +448,7 @@ impl Debug for ${style_struct.gecko_struct_name} {
     # These are currently being shuffled to a different style struct on the gecko side.
     force_stub += ["backface-visibility", "transform-box", "transform-style"]
     # These live in an nsFont member in Gecko. Should be straightforward to do manually.
-    force_stub += ["font-kerning", "font-stretch", "font-variant"]
+    force_stub += ["font-kerning", "font-variant"]
     # These have unusual representations in gecko.
     force_stub += ["list-style-type", "text-overflow"]
     # In a nsTArray, have to be done manually, but probably not too much work
@@ -739,7 +740,7 @@ fn static_assert() {
 </%self:impl_trait>
 
 <%self:impl_trait style_struct_name="Font"
-    skip_longhands="font-family font-style font-size font-weight"
+    skip_longhands="font-family font-stretch font-style font-size font-weight"
     skip_additionals="*">
 
     pub fn set_font_family(&mut self, v: longhands::font_family::computed_value::T) {
@@ -789,6 +790,24 @@ fn static_assert() {
     pub fn clone_font_size(&self) -> longhands::font_size::computed_value::T {
         Au(self.gecko.mSize)
     }
+
+    pub fn set_font_stretch(&mut self, v: longhands::font_stretch::computed_value::T) {
+        use computed_values::font_stretch::T;
+
+        self.gecko.mFont.stretch = match v {
+            T::normal => structs::NS_FONT_STRETCH_NORMAL as i16,
+            T::ultra_condensed => structs::NS_FONT_STRETCH_ULTRA_CONDENSED as i16,
+            T::extra_condensed => structs::NS_FONT_STRETCH_EXTRA_CONDENSED as i16,
+            T::condensed => structs::NS_FONT_STRETCH_CONDENSED as i16,
+            T::semi_condensed => structs::NS_FONT_STRETCH_SEMI_CONDENSED as i16,
+            T::semi_expanded => structs::NS_FONT_STRETCH_SEMI_EXPANDED as i16,
+            T::expanded => structs::NS_FONT_STRETCH_EXPANDED as i16,
+            T::extra_expanded => structs::NS_FONT_STRETCH_EXTRA_EXPANDED as i16,
+            T::ultra_expanded => structs::NS_FONT_STRETCH_ULTRA_EXPANDED as i16,
+        };
+    }
+
+    ${impl_simple_copy('font_stretch', 'mFont.stretch')}
 
     pub fn set_font_weight(&mut self, v: longhands::font_weight::computed_value::T) {
         self.gecko.mFont.weight = v as u16;
@@ -1916,7 +1935,7 @@ clip-path
 #[allow(non_snake_case, unused_variables)]
 pub extern "C" fn Servo_GetStyle${style_struct.gecko_name}(computed_values:
         ServoComputedValuesBorrowedOrNull) -> *const ${style_struct.gecko_ffi_name} {
-    computed_values.as_arc::<ComputedValues>().get_${style_struct.name_lower}().get_gecko()
+    ComputedValues::arc_from_borrowed(&computed_values).unwrap().get_${style_struct.name_lower}().get_gecko()
         as *const ${style_struct.gecko_ffi_name}
 }
 </%def>

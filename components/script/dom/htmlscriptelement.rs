@@ -259,8 +259,6 @@ fn fetch_a_classic_script(script: &HTMLScriptElement,
         status: Ok(())
     }));
 
-    let doc = document_from_node(script);
-
     let (action_sender, action_receiver) = ipc::channel().unwrap();
     let listener = NetworkListener {
         context: context,
@@ -271,7 +269,7 @@ fn fetch_a_classic_script(script: &HTMLScriptElement,
     ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
         listener.notify_fetch(message.to().unwrap());
     });
-    doc.fetch_async(LoadType::Script(url), request, action_sender, None);
+    doc.fetch_async(LoadType::Script(url), request, action_sender);
 }
 
 impl HTMLScriptElement {
