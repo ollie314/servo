@@ -6,8 +6,7 @@
 
 #![allow(unsafe_code)]
 
-use atomic_refcell::{AtomicRef, AtomicRefMut};
-use data::PersistentStyleData;
+use data::PseudoStyles;
 use element_state::ElementState;
 use parking_lot::RwLock;
 use properties::{ComputedValues, PropertyDeclarationBlock};
@@ -20,9 +19,7 @@ use std::ops::BitOr;
 use std::sync::Arc;
 use string_cache::{Atom, Namespace};
 
-/// Opaque type stored in type-unsafe work queues for parallel layout.
-/// Must be transmutable to and from TNode.
-pub type UnsafeNode = (usize, usize);
+pub use style_traits::UnsafeNode;
 
 /// An opaque handle to a node, which, unlike UnsafeNode, cannot be transformed
 /// back into a non-opaque representation. The only safe operation that can be
@@ -139,13 +136,33 @@ pub trait TNode : Sized + Copy + Clone + NodeInfo {
 
     unsafe fn set_can_be_fragmented(&self, value: bool);
 
-    /// Borrows the style data immutably. Fails on a conflicting borrow.
-    #[inline(always)]
-    fn borrow_data(&self) -> Option<AtomicRef<PersistentStyleData>>;
+    /// Atomically stores the number of children of this node that we will
+    /// need to process during bottom-up traversal.
+    fn store_children_to_process(&self, n: isize);
 
-    /// Borrows the style data mutably. Fails on a conflicting borrow.
-    #[inline(always)]
-    fn mutate_data(&self) -> Option<AtomicRefMut<PersistentStyleData>>;
+    /// Atomically notes that a child has been processed during bottom-up
+    /// traversal. Returns the number of children left to process.
+    fn did_process_child(&self) -> isize;
+
+    /// Returns the computed style values corresponding to the existing style
+    /// for this node, if any.
+    ///
+    /// This returns an cloned Arc (rather than a borrow) to abstract over the
+    /// multitude of ways these values may be stored under the hood. By
+    /// returning an enum with various OwningRef/OwningHandle entries, we could
+    /// avoid the refcounting traffic here, but it's probably not worth the
+    /// complexity.
+    fn get_existing_style(&self) -> Option<Arc<ComputedValues>>;
+
+    /// Sets the computed style for this node.
+    fn set_style(&self, style: Option<Arc<ComputedValues>>);
+
+    /// Transfers ownership of the existing pseudo styles, if any, to the
+    /// caller. The stored pseudo styles are replaced with an empty map.
+    fn take_pseudo_styles(&self) -> PseudoStyles;
+
+    /// Sets the pseudo styles on the element, replacing any existing styles.
+    fn set_pseudo_styles(&self, styles: PseudoStyles);
 
     /// Get the description of how to account for recent style changes.
     fn restyle_damage(self) -> Self::ConcreteRestyleDamage;
@@ -162,11 +179,6 @@ pub trait TNode : Sized + Copy + Clone + NodeInfo {
     fn prev_sibling(&self) -> Option<Self>;
 
     fn next_sibling(&self) -> Option<Self>;
-
-    /// Removes the style from this node.
-    fn unstyle(self) {
-        self.mutate_data().unwrap().style = None;
-    }
 
     /// XXX: It's a bit unfortunate we need to pass the current computed values
     /// as an argument here, but otherwise Servo would crash due to double

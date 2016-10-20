@@ -8,6 +8,7 @@
 //! [position]: https://drafts.csswg.org/css-backgrounds-3/#position
 
 use cssparser::{Parser, ToCss, Token};
+use parser::Parse;
 use std::fmt;
 use values::HasViewportPercentage;
 use values::computed::{CalcLengthOrPercentage, Context};
@@ -212,6 +213,15 @@ impl Position {
                     Position::new(None, None, Some(first), Some(second))
                 }
             }
+        }
+    }
+
+    pub fn center() -> Position {
+        Position {
+            horiz_keyword: Some(Keyword::Center),
+            horiz_position: None,
+            vert_keyword: Some(Keyword::Center),
+            vert_position: None,
         }
     }
 }

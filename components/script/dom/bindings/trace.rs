@@ -57,7 +57,7 @@ use js::jsapi::{GCTraceKindToAscii, Heap, JSObject, JSTracer, TraceKind};
 use js::jsval::JSVal;
 use js::rust::Runtime;
 use libc;
-use msg::constellation_msg::{FrameType, PipelineId, ReferrerPolicy, WindowSizeType};
+use msg::constellation_msg::{FrameId, FrameType, PipelineId, ReferrerPolicy, WindowSizeType};
 use net_traits::{Metadata, NetworkError, ResourceThreads};
 use net_traits::filemanager_thread::RelativePos;
 use net_traits::image::base::{Image, ImageMetadata};
@@ -78,9 +78,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::boxed::FnBox;
 use std::cell::{Cell, UnsafeCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hash};
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -209,6 +208,15 @@ impl<T: JSTraceable> JSTraceable for Vec<T> {
     }
 }
 
+impl<T: JSTraceable> JSTraceable for VecDeque<T> {
+    #[inline]
+    fn trace(&self, trc: *mut JSTracer) {
+        for e in &*self {
+            e.trace(trc);
+        }
+    }
+}
+
 impl<T: JSTraceable> JSTraceable for (T, T, T, T) {
     fn trace(&self, trc: *mut JSTracer) {
         self.0.trace(trc);
@@ -308,7 +316,7 @@ no_jsmanaged_fields!(PropertyDeclarationBlock);
 no_jsmanaged_fields!(HashSet<T>);
 // These three are interdependent, if you plan to put jsmanaged data
 // in one of these make sure it is propagated properly to containing structs
-no_jsmanaged_fields!(FrameType, WindowSizeData, WindowSizeType, PipelineId);
+no_jsmanaged_fields!(FrameId, FrameType, WindowSizeData, WindowSizeType, PipelineId);
 no_jsmanaged_fields!(TimerEventId, TimerSource);
 no_jsmanaged_fields!(WorkerId);
 no_jsmanaged_fields!(QuirksMode);
@@ -550,13 +558,6 @@ impl<'a, T: JSTraceable + Reflectable> RootedVec<'a, JS<T>> {
         RootedVec {
             root: root,
         }
-    }
-}
-
-impl<'a, T: JSTraceable + Reflectable> RootedVec<'a, JS<T>> {
-    /// Obtain a safe slice of references that can't outlive that RootedVec.
-    pub fn r(&self) -> &[&T] {
-        unsafe { mem::transmute(&self[..]) }
     }
 }
 

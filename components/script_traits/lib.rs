@@ -6,8 +6,8 @@
 //! The traits are here instead of in script so that these modules won't have
 //! to depend on script.
 
-#![feature(custom_derive, plugin)]
-#![plugin(heapsize_plugin, plugins, serde_macros)]
+#![feature(custom_derive, plugin, proc_macro, rustc_attrs, structural_match)]
+#![plugin(heapsize_plugin, plugins)]
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
@@ -20,7 +20,6 @@ extern crate gfx_traits;
 extern crate heapsize;
 extern crate hyper_serde;
 extern crate ipc_channel;
-extern crate layers;
 extern crate libc;
 extern crate msg;
 extern crate net_traits;
@@ -28,10 +27,11 @@ extern crate offscreen_gl_context;
 extern crate profile_traits;
 extern crate rustc_serialize;
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate style_traits;
 extern crate time;
 extern crate url;
-extern crate util;
 
 mod script_msg;
 pub mod webdriver_msg;
@@ -44,12 +44,12 @@ use euclid::point::Point2D;
 use euclid::rect::Rect;
 use euclid::scale_factor::ScaleFactor;
 use euclid::size::TypedSize2D;
+use gfx_traits::DevicePixel;
 use gfx_traits::Epoch;
 use gfx_traits::LayerId;
 use gfx_traits::StackingContextId;
 use heapsize::HeapSizeOf;
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
-use layers::geometry::DevicePixel;
 use libc::c_void;
 use msg::constellation_msg::{FrameId, FrameType, Image, Key, KeyModifiers, KeyState, LoadData};
 use msg::constellation_msg::{PipelineId, PipelineNamespaceId, ReferrerPolicy};
@@ -64,9 +64,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::mpsc::{Receiver, Sender};
-use style_traits::{PagePx, ViewportPx};
+use style_traits::{PagePx, UnsafeNode, ViewportPx};
 use url::Url;
-use util::ipc::OptionalOpaqueIpcSender;
 use webdriver_msg::{LoadStatus, WebDriverScriptCommand};
 
 pub use script_msg::{LayoutMsg, ScriptMsg, EventResult, LogEntry};
@@ -136,9 +135,6 @@ pub struct NewLayoutInfo {
     pub frame_type: FrameType,
     /// Network request data which will be initiated by the script thread.
     pub load_data: LoadData,
-    /// The paint channel, cast to `OptionalOpaqueIpcSender`. This is really an
-    /// `Sender<LayoutToPaintMsg>`.
-    pub paint_chan: OptionalOpaqueIpcSender,
     /// A port on which layout can receive messages from the pipeline.
     pub pipeline_port: IpcReceiver<LayoutControlMsg>,
     /// A sender for the layout thread to communicate to the constellation.
@@ -195,6 +191,8 @@ pub enum ConstellationControlMsg {
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
     TickAllAnimations(PipelineId),
+    /// Notifies the script thread of a transition end
+    TransitionEnd(UnsafeNode, String, f64),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId),
@@ -236,6 +234,7 @@ impl fmt::Debug for ConstellationControlMsg {
             FocusIFrame(..) => "FocusIFrame",
             WebDriverScriptCommand(..) => "WebDriverScriptCommand",
             TickAllAnimations(..) => "TickAllAnimations",
+            TransitionEnd(..) => "TransitionEnd",
             WebFontLoaded(..) => "WebFontLoaded",
             DispatchFrameLoadEvent { .. } => "DispatchFrameLoadEvent",
             FramedContentChanged(..) => "FramedContentChanged",
@@ -449,6 +448,8 @@ pub struct IFrameLoadInfo {
     pub load_data: Option<LoadData>,
     /// Pipeline ID of the parent of this iframe
     pub parent_pipeline_id: PipelineId,
+    /// The ID for this iframe.
+    pub frame_id: FrameId,
     /// The old pipeline ID for this iframe, if a page was previously loaded.
     pub old_pipeline_id: Option<PipelineId>,
     /// The new pipeline ID that the iframe has generated.

@@ -9,14 +9,15 @@
 #![feature(box_syntax)]
 #![feature(custom_attribute)]
 #![feature(custom_derive)]
-#![feature(mpsc_select)]
 #![feature(plugin)]
+#![feature(proc_macro)]
 #![feature(range_contains)]
+#![feature(rustc_attrs)]
+#![feature(structural_match)]
 #![feature(unique)]
 
 #![plugin(heapsize_plugin)]
 #![plugin(plugins)]
-#![plugin(serde_macros)]
 
 #![deny(unsafe_code)]
 
@@ -55,7 +56,6 @@ extern crate harfbuzz_sys as harfbuzz;
 
 extern crate heapsize;
 extern crate ipc_channel;
-extern crate layers;
 #[allow(unused_extern_crates)]
 #[macro_use]
 extern crate lazy_static;
@@ -67,12 +67,11 @@ extern crate msg;
 extern crate net_traits;
 extern crate ordered_float;
 #[macro_use]
-extern crate profile_traits;
-extern crate rand;
-#[macro_use]
 extern crate range;
 extern crate rustc_serialize;
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 extern crate simd;
@@ -105,8 +104,6 @@ pub mod display_list;
 pub mod font_cache_thread;
 pub mod font_context;
 pub mod font_template;
-
-pub mod paint_thread;
 
 // Platform-specific implementations.
 #[allow(unsafe_code)]

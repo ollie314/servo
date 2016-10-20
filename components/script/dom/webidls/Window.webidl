@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 // https://html.spec.whatwg.org/multipage/#window
-[PrimaryGlobal, Exposed=(Window,Worker)]
-/*sealed*/ interface Window : EventTarget {
+[PrimaryGlobal]
+/*sealed*/ interface Window : GlobalScope {
   // the current browsing context
   [Unforgeable] readonly attribute WindowProxy window;
   [BinaryName="Self_", Replaceable] readonly attribute WindowProxy self;
@@ -62,7 +62,7 @@
 Window implements GlobalEventHandlers;
 Window implements WindowEventHandlers;
 
-[NoInterfaceObject, Exposed=(Window,Worker)]
+[NoInterfaceObject]
 interface WindowProxy {};
 
 // https://html.spec.whatwg.org/multipage/#timers
@@ -170,14 +170,14 @@ partial interface Window {
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-sessionstorage
-[NoInterfaceObject, Exposed=(Window,Worker)]
+[NoInterfaceObject]
 interface WindowSessionStorage {
   readonly attribute Storage sessionStorage;
 };
 Window implements WindowSessionStorage;
 
 // https://html.spec.whatwg.org/multipage/#dom-localstorage
-[NoInterfaceObject, Exposed=(Window,Worker)]
+[NoInterfaceObject]
 interface WindowLocalStorage {
   readonly attribute Storage localStorage;
 };

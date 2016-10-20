@@ -14,11 +14,11 @@
 #![feature(on_unimplemented)]
 #![feature(optin_builtin_traits)]
 #![feature(plugin)]
+#![feature(question_mark)]
 #![feature(slice_patterns)]
 #![feature(stmt_expr_attributes)]
-#![feature(question_mark)]
-#![feature(try_borrow)]
 #![feature(try_from)]
+#![feature(untagged_unions)]
 
 #![deny(unsafe_code)]
 #![allow(non_snake_case)]
@@ -105,7 +105,6 @@ pub mod layout_wrapper;
 mod mem;
 mod network_listener;
 pub mod origin;
-pub mod parse;
 pub mod script_runtime;
 #[allow(unsafe_code)]
 pub mod script_thread;

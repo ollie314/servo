@@ -11,7 +11,6 @@ import argparse
 import platform
 import copy
 import subprocess
-import tempfile
 
 import regen_atoms
 
@@ -42,7 +41,6 @@ COMPILATION_TARGETS = {
     # Generation of style structs.
     "structs": {
         "target_dir": "../gecko_bindings",
-        "test": True,
         "flags": [
             "--ignore-functions",
             "--ignore-methods",
@@ -70,12 +68,13 @@ COMPILATION_TARGETS = {
         "raw_lines": [
             # We can get rid of this when the bindings move into the style crate.
             "pub enum OpaqueStyleData {}",
+            "pub use nsstring::nsStringRepr as nsString;"
         ],
+        "blacklist_types": ["nsString"],
         "whitelist_vars": [
             "NS_THEME_.*",
             "NODE_.*",
-            "NS_FONT_STRETCH_.*",
-            "NS_FONT_STYLE_.*",
+            "NS_FONT_.*",
             "NS_STYLE_.*",
             "NS_CORNER_.*",
             "NS_RADIUS_.*",
@@ -83,71 +82,112 @@ COMPILATION_TARGETS = {
             "BORDER_STYLE_.*"
         ],
         "whitelist": [
-            "RawGeckoNode",
-            "RawGeckoElement",
-            "RawGeckoDocument",
-            "Element",
-            "Side",
-            "nsTArrayHeader",
-            "nsCSSValueGradient",
-            "nsCSSValueList_heap",
-            "FrameRequestCallback",
-            "nsCSSValueTriplet_heap",
-            "nsCSSRect_heap",
             "AnonymousContent",
-            "nsCSSValuePairList",
-            "nsCSSValuePairList_heap",
-            "nsCSSValuePair_heap",
-            "CapturingContentInfo",
-            "Runnable",
             "AudioContext",
+            "CapturingContentInfo",
+            "DefaultDelete",
+            "Element",
+            "FontFamilyList",
             "FontFamilyListRefCnt",
-            "ImageURL",
-            "Image",
-            "nsCSSValueFloatColor",
-            "ServoAttrSnapshot",
+            "FontFamilyName",
+            "FontFamilyType",
+            "FragmentOrURL",
+            "FrameRequestCallback",
+            "gfxAlternateValue",
+            "gfxFontFeature",
             "GridNamedArea",
+            "Image",
+            "ImageURL",
             "nsAttrName",
             "nsAttrValue",
-            "nsCSSRect",
-            "gfxFontFeature",
-            "gfxAlternateValue",
-            "nsCSSValueTokenStream",
-            "nsSize",
-            "pair",
-            "StyleClipPathGeometryBox",
-            "FontFamilyName",
-            "nsCSSPropertyID",
-            "StyleAnimation",
-            "StyleTransition",
-            "nsresult",
-            "nsCSSValueGradientStop",
             "nsBorderColors",
-            "Position",
-            "nsCSSValueList",
+            "nsChangeHint",
+            "nscolor",
+            "nsCSSPropertyID",
+            "nsCSSRect",
+            "nsCSSRect_heap",
+            "nsCSSShadowArray",
             "nsCSSValue",
-            "UniquePtr", "DefaultDelete",
-            "StyleBasicShape",
+            "nsCSSValueFloatColor",
+            "nsCSSValueGradient",
+            "nsCSSValueGradientStop",
+            "nsCSSValueList",
+            "nsCSSValueList_heap",
+            "nsCSSValuePair_heap",
+            "nsCSSValuePairList",
+            "nsCSSValuePairList_heap",
+            "nsCSSValueTokenStream",
+            "nsCSSValueTriplet_heap",
+            "nsCursorImage",
+            "nsFont",
+            "nsIAtom",
+            "nsMainThreadPtrHandle",
+            "nsMainThreadPtrHolder",
             "nsMargin",
+            "nsRect",
+            "nsRestyleHint",
+            "nsresult",
+            "nsSize",
+            "nsStyleBackground",
+            "nsStyleBorder",
+            "nsStyleColor",
+            "nsStyleColumn",
+            "nsStyleContent",
             "nsStyleContentData",
-            "nsStyleFilter", "nsRect", "FragmentOrURL", "nsStyleCoord",
-            "nsStyleCounterData", "StaticRefPtr", "nsTArray", "nsStyleFont",
-            "nsStyleColor", "nsStyleList", "nsStyleText", "nsStyleVisibility",
-            "nsStyleUserInterface", "nsStyleTableBorder", "nsStyleSVG",
-            "nsStyleVariables", "nsStyleBackground", "nsStylePosition",
-            "nsStyleTextReset", "nsStyleDisplay", "nsStyleContent",
-            "nsStyleUIReset", "nsStyleTable", "nsStyleMargin",
-            "nsStylePadding", "nsStyleBorder", "nsStyleOutline", "nsStyleXUL",
-            "nsStyleSVGReset", "nsStyleColumn", "nsStyleEffects",
-            "nsStyleImage", "nsStyleGradient", "nsStyleCoord",
-            "nsStyleGradientStop", "nsStyleImageLayers",
-            "nsStyleImageLayers_Layer", "nsStyleImageLayers_LayerType",
-            "nsStyleUnit", "nsStyleUnion", "nsStyleCoord", "nsRestyleHint",
-            "ServoElementSnapshot", "nsChangeHint", "SheetParsingMode",
-            "nsMainThreadPtrHandle", "nsMainThreadPtrHolder", "nscolor",
-            "nsFont", "FontFamilyList", "FontFamilyType", "nsIAtom",
-            "nsStyleContext", "StyleClipPath", "StyleBasicShapeType",
-            "StyleBasicShape", "nsCSSShadowArray",
+            "nsStyleContext",
+            "nsStyleCoord",
+            "nsStyleCoord",
+            "nsStyleCoord",
+            "nsStyleCounterData",
+            "nsStyleDisplay",
+            "nsStyleEffects",
+            "nsStyleFilter",
+            "nsStyleFont",
+            "nsStyleGradient",
+            "nsStyleGradientStop",
+            "nsStyleImage",
+            "nsStyleImageLayers",
+            "nsStyleImageLayers_Layer",
+            "nsStyleImageLayers_LayerType",
+            "nsStyleList",
+            "nsStyleMargin",
+            "nsStyleOutline",
+            "nsStylePadding",
+            "nsStylePosition",
+            "nsStyleSVG",
+            "nsStyleSVGReset",
+            "nsStyleTable",
+            "nsStyleTableBorder",
+            "nsStyleText",
+            "nsStyleTextReset",
+            "nsStyleUIReset",
+            "nsStyleUnion",
+            "nsStyleUnit",
+            "nsStyleUserInterface",
+            "nsStyleVariables",
+            "nsStyleVisibility",
+            "nsStyleXUL",
+            "nsTArray",
+            "nsTArrayHeader",
+            "pair",
+            "Position",
+            "RawGeckoDocument",
+            "RawGeckoElement",
+            "RawGeckoNode",
+            "Runnable",
+            "ServoAttrSnapshot",
+            "ServoElementSnapshot",
+            "SheetParsingMode",
+            "Side",
+            "StaticRefPtr",
+            "StyleAnimation",
+            "StyleBasicShape",
+            "StyleBasicShape",
+            "StyleBasicShapeType",
+            "StyleClipPath",
+            "StyleClipPathGeometryBox",
+            "StyleTransition",
+            "UniquePtr",
         ],
         "opaque_types": [
             "atomic___base",
@@ -196,9 +236,7 @@ COMPILATION_TARGETS = {
     # Generation of the ffi bindings.
     "bindings": {
         "target_dir": "../gecko_bindings",
-        "raw_lines": [
-            "use heapsize::HeapSizeOf;",
-        ],
+        "raw_lines": [],
         "flags": [
             "--ignore-methods",
         ],
@@ -213,29 +251,66 @@ COMPILATION_TARGETS = {
 
         # Types to just use from the `structs` target.
         "structs_types": [
-            "nsStyleFont", "nsStyleColor", "nsStyleList", "nsStyleText",
-            "nsStyleVisibility", "nsStyleUserInterface", "nsStyleTableBorder",
-            "nsStyleSVG", "nsStyleVariables", "nsStyleBackground",
-            "nsStylePosition", "nsStyleTextReset", "nsStyleDisplay",
-            "nsStyleContent", "nsStyleUIReset", "nsStyleTable",
-            "nsStyleMargin", "nsStylePadding", "nsStyleBorder",
-            "nsStyleOutline", "nsStyleXUL", "nsStyleSVGReset", "nsStyleColumn",
-            "nsStyleEffects", "nsStyleImage", "nsStyleGradient",
-            "nsStyleCoord", "nsStyleGradientStop", "nsStyleImageLayers",
-            "nsStyleImageLayers_Layer", "nsStyleImageLayers_LayerType",
-            "nsStyleUnit", "nsStyleUnion", "nsStyleCoord_CalcValue",
-            "nsStyleCoord_Calc", "nsRestyleHint", "ServoElementSnapshot",
-            "nsChangeHint", "SheetParsingMode", "nsMainThreadPtrHandle",
-            "nsMainThreadPtrHolder", "nscolor", "nsFont", "FontFamilyList",
-            "FontFamilyType", "nsIAtom", "nsStyleContext", "StyleClipPath",
-            "StyleBasicShapeType", "StyleBasicShape", "nsCSSShadowArray",
-            "nsINode", "nsIDocument", "nsIPrincipal", "nsIURI",
-            "RawGeckoNode", "RawGeckoElement", "RawGeckoDocument",
-            "ServoNodeData",
+            "FontFamilyList",
+            "FontFamilyType",
+            "RawGeckoDocument",
+            "RawGeckoElement",
+            "RawGeckoNode",
+            "ServoElementSnapshot",
+            "SheetParsingMode",
+            "StyleBasicShape",
+            "StyleBasicShapeType",
+            "StyleClipPath",
+            "nsCSSShadowArray",
+            "nsChangeHint",
+            "nsFont",
+            "nsIAtom",
+            "nsIPrincipal",
+            "nsIURI",
+            "nsMainThreadPtrHolder",
+            "nsRestyleHint",
+            "nsString",
+            "nsStyleBackground",
+            "nsStyleBorder",
+            "nsStyleColor",
+            "nsStyleColumn",
+            "nsStyleContent",
+            "nsStyleContext",
+            "nsStyleCoord",
+            "nsStyleCoord_Calc",
+            "nsStyleCoord_CalcValue",
+            "nsStyleDisplay",
+            "nsStyleEffects",
+            "nsStyleFont",
+            "nsStyleGradient",
+            "nsStyleGradientStop",
+            "nsStyleImage",
+            "nsStyleImageLayers",
+            "nsStyleImageLayers_Layer",
+            "nsStyleImageLayers_LayerType",
+            "nsStyleList",
+            "nsStyleMargin",
+            "nsStyleOutline",
+            "nsStylePadding",
+            "nsStylePosition",
+            "nsStyleQuoteValues",
+            "nsStyleSVG",
+            "nsStyleSVGReset",
+            "nsStyleTable",
+            "nsStyleTableBorder",
+            "nsStyleText",
+            "nsStyleTextReset",
+            "nsStyleUIReset",
+            "nsStyleUnion",
+            "nsStyleUnit",
+            "nsStyleUserInterface",
+            "nsStyleVariables",
+            "nsStyleVisibility",
+            "nsStyleXUL",
         ],
         "servo_nullable_arc_types": [
             "ServoComputedValues", "RawServoStyleSheet",
-            "ServoDeclarationBlock"
+            "RawServoDeclarationBlock"
         ],
         "servo_owned_types": [
             "RawServoStyleSet",
@@ -245,6 +320,7 @@ COMPILATION_TARGETS = {
             "RawGeckoNode",
             "RawGeckoElement",
             "RawGeckoDocument",
+            "RawServoDeclarationBlockStrong",
         ],
         "whitelist_functions": [
             "Servo_.*",
@@ -431,6 +507,11 @@ def build(objdir, target_name, debug, debugger, kind_name=None,
             flags.append("--opaque-type")
             flags.append(ty)
 
+    if "blacklist_types" in current_target:
+        for ty in current_target["blacklist_types"]:
+            flags.append("--blacklist-type")
+            flags.append(ty)
+
     if "servo_nullable_arc_types" in current_target:
         for ty in current_target["servo_nullable_arc_types"]:
             flags.append("--blacklist-type")
@@ -543,48 +624,10 @@ Option<&'a {0}>;".format(ty))
         return 1
 
     print("OK")
+    print("(please test with ./mach test-stylo)")
 
     if verbose:
         print(output)
-
-    if current_target.get("test", False) and not skip_test:
-        print("[RUSTC]... ", end='')
-        sys.stdout.flush()
-
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            test_file = f.name
-        output = None
-        try:
-            rustc_command = ["rustc", output_filename, "--test", "-o", test_file]
-            output = subprocess.check_output(rustc_command, stderr=subprocess.STDOUT)
-            output = output.decode('utf8')
-        except subprocess.CalledProcessError as e:
-            print("FAIL\n", e.output.decode('utf8'))
-            return 1
-
-        print("OK")
-
-        if verbose:
-            print(output)
-
-        print("[RUSTC_TEST]... ", end='')
-        sys.stdout.flush()
-
-        try:
-            output = subprocess.check_output([test_file], stderr=subprocess.STDOUT)
-            output = output.decode('utf8')
-        except subprocess.CalledProcessError as e:
-            print("tests failed: ", e.output.decode('utf8'))
-            return 1
-
-        os.remove(test_file)
-        print("OK")
-
-        # TODO: this -3 is hacky as heck
-        print(output.split('\n')[-3])
-
-        if verbose:
-            print(output)
 
     return 0
 

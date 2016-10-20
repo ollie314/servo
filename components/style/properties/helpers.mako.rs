@@ -16,19 +16,24 @@
     </%call>
 </%def>
 
-<%def name="predefined_type(name, type, initial_value, parse_method='parse', **kwargs)">
+<%def name="predefined_type(name, type, initial_value, parse_method='parse', needs_context=False, **kwargs)">
     <%call expr="longhand(name, predefined_type=type, **kwargs)">
         #[allow(unused_imports)]
         use app_units::Au;
         use cssparser::{Color as CSSParserColor, RGBA};
-        pub type SpecifiedValue = specified::${type};
+        pub use values::specified::${type} as SpecifiedValue;
         pub mod computed_value {
             pub use values::computed::${type} as T;
         }
         #[inline] pub fn get_initial_value() -> computed_value::T { ${initial_value} }
-        #[inline] pub fn parse(_context: &ParserContext, input: &mut Parser)
+        #[allow(unused_variables)]
+        #[inline] pub fn parse(context: &ParserContext, input: &mut Parser)
                                -> Result<SpecifiedValue, ()> {
+            % if needs_context:
+            specified::${type}::${parse_method}(context, input)
+            % else:
             specified::${type}::${parse_method}(input)
+            % endif
         }
     </%call>
 </%def>
@@ -173,8 +178,10 @@
             use parser::{ParserContext, ParserContextExtraData};
             use properties::{CSSWideKeyword, DeclaredValue, Shorthand};
         % endif
+        #[allow(unused_imports)]
         use cascade_info::CascadeInfo;
         use error_reporting::ParseErrorReporter;
+        use parser::Parse;
         use properties::longhands;
         use properties::property_bit_field::PropertyBitField;
         use properties::{ComputedValues, PropertyDeclaration};
@@ -565,6 +572,8 @@
     <%self:shorthand name="${name}" sub_properties="${
             ' '.join(sub_property_pattern % side
                      for side in ['top', 'right', 'bottom', 'left'])}">
+        #[allow(unused_imports)]
+        use parser::Parse;
         use super::parse_four_sides;
         use values::specified;
 

@@ -5,7 +5,7 @@
 //! Element nodes.
 
 use app_units::Au;
-use cssparser::{Color, ToCss};
+use cssparser::Color;
 use devtools_traits::AttrInfo;
 use dom::activation::Activatable;
 use dom::attr::{Attr, AttrHelpersForLayout};
@@ -21,7 +21,6 @@ use dom::bindings::codegen::Bindings::WindowBinding::{ScrollBehavior, ScrollToOp
 use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::UnionTypes::NodeOrString;
 use dom::bindings::error::{Error, ErrorResult, Fallible};
-use dom::bindings::global::GlobalRef;
 use dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use dom::bindings::js::{JS, LayoutJS, MutNullableHeap};
 use dom::bindings::js::{Root, RootedReference};
@@ -736,14 +735,8 @@ impl Element {
 
     // this sync method is called upon modification of the style_attribute property,
     // therefore, it should not trigger subsequent mutation events
-    pub fn sync_property_with_attrs_style(&self) {
-        let style_str = if let &Some(ref declarations) = &*self.style_attribute().borrow() {
-            declarations.read().to_css_string()
-        } else {
-            String::new()
-        };
-
-        let mut new_style = AttrValue::String(style_str);
+    pub fn set_style_attr(&self, new_value: String) {
+        let mut new_style = AttrValue::String(new_value);
 
         if let Some(style_attr) = self.attrs.borrow().iter().find(|a| a.name() == &atom!("style")) {
             style_attr.swap_value(&mut new_style);
@@ -763,125 +756,6 @@ impl Element {
 
          assert!(attr.GetOwnerElement().r() == Some(self));
          self.attrs.borrow_mut().push(JS::from_ref(&attr));
-    }
-
-    pub fn remove_inline_style_property(&self, property: &str) {
-        fn remove(element: &Element, property: &str) {
-            let mut inline_declarations = element.style_attribute.borrow_mut();
-            if let &mut Some(ref mut declarations) = &mut *inline_declarations {
-                let mut importance = None;
-                let index = declarations.read().declarations.iter().position(|&(ref decl, i)| {
-                    let matching = decl.matches(property);
-                    if matching {
-                        importance = Some(i)
-                    }
-                    matching
-                });
-                if let Some(index) = index {
-                    let mut declarations = declarations.write();
-                    declarations.declarations.remove(index);
-                    if importance.unwrap().important() {
-                        declarations.important_count -= 1;
-                    }
-                }
-            }
-        }
-
-        remove(self, property);
-        self.sync_property_with_attrs_style();
-    }
-
-    pub fn update_inline_style(&self,
-                               declarations: Vec<PropertyDeclaration>,
-                               importance: Importance) {
-        fn update(element: &Element, declarations: Vec<PropertyDeclaration>,
-                  importance: Importance) {
-            let mut inline_declarations = element.style_attribute().borrow_mut();
-            if let &mut Some(ref mut declaration_block) = &mut *inline_declarations {
-                {
-                    let mut declaration_block = declaration_block.write();
-                    let declaration_block = &mut *declaration_block;
-                    let existing_declarations = &mut declaration_block.declarations;
-
-                    'outer: for incoming_declaration in declarations {
-                        for existing_declaration in &mut *existing_declarations {
-                            if existing_declaration.0.name() == incoming_declaration.name() {
-                                match (existing_declaration.1, importance) {
-                                    (Importance::Normal, Importance::Important) => {
-                                        declaration_block.important_count += 1;
-                                    }
-                                    (Importance::Important, Importance::Normal) => {
-                                        declaration_block.important_count -= 1;
-                                    }
-                                    _ => {}
-                                }
-                                *existing_declaration = (incoming_declaration, importance);
-                                continue 'outer;
-                            }
-                        }
-                        existing_declarations.push((incoming_declaration, importance));
-                        if importance.important() {
-                            declaration_block.important_count += 1;
-                        }
-                    }
-                }
-                return;
-            }
-
-            let important_count = if importance.important() {
-                declarations.len() as u32
-            } else {
-                0
-            };
-
-            *inline_declarations = Some(Arc::new(RwLock::new(PropertyDeclarationBlock {
-                declarations: declarations.into_iter().map(|d| (d, importance)).collect(),
-                important_count: important_count,
-            })));
-        }
-
-        update(self, declarations, importance);
-        self.sync_property_with_attrs_style();
-    }
-
-    pub fn set_inline_style_property_priority(&self,
-                                              properties: &[&str],
-                                              new_importance: Importance) {
-        {
-            let mut inline_declarations = self.style_attribute().borrow_mut();
-            if let &mut Some(ref mut block) = &mut *inline_declarations {
-                let mut block = block.write();
-                let block = &mut *block;
-                let declarations = &mut block.declarations;
-                for &mut (ref declaration, ref mut importance) in declarations {
-                    if properties.iter().any(|p| declaration.name() == **p) {
-                        match (*importance, new_importance) {
-                            (Importance::Normal, Importance::Important) => {
-                                block.important_count += 1;
-                            }
-                            (Importance::Important, Importance::Normal) => {
-                                block.important_count -= 1;
-                            }
-                            _ => {}
-                        }
-                        *importance = new_importance;
-                    }
-                }
-            }
-        }
-
-        self.sync_property_with_attrs_style();
-    }
-
-    pub fn get_inline_style_declaration<F, R>(&self, property: &str, f: F) -> R
-    where F: FnOnce(Option<&(PropertyDeclaration, Importance)>) -> R {
-        let style_attr = self.style_attribute.borrow();
-        if let Some(ref block) = *style_attr {
-            let block = block.read();
-            f(block.get(property))
-        } else {
-            f(None)
-        }
     }
 
     pub fn serialize(&self, traversal_scope: TraversalScope) -> Fallible<DOMString> {
@@ -1209,8 +1083,7 @@ impl Element {
 
     pub fn get_tokenlist_attribute(&self, local_name: &Atom) -> Vec<Atom> {
         self.get_attribute(&ns!(), local_name).map(|attr| {
-            attr.r()
-                .value()
+            attr.value()
                 .as_tokens()
                 .to_vec()
         }).unwrap_or(vec!())
@@ -1236,7 +1109,7 @@ impl Element {
 
         match attribute {
             Some(ref attribute) => {
-                match *attribute.r().value() {
+                match *attribute.value() {
                     AttrValue::Int(_, value) => value,
                     _ => panic!("Expected an AttrValue::Int: \
                                  implement parse_plain_attribute"),
@@ -1503,7 +1376,7 @@ impl ElementMethods for Element {
             let old_attr = Root::from_ref(&*self.attrs.borrow()[position]);
 
             // Step 3.
-            if old_attr.r() == attr {
+            if &*old_attr == attr {
                 return Ok(Some(Root::from_ref(attr)));
             }
 
@@ -1566,7 +1439,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-element-getelementsbytagname
     fn GetElementsByTagName(&self, localname: DOMString) -> Root<HTMLCollection> {
         let window = window_from_node(self);
-        HTMLCollection::by_tag_name(window.r(), self.upcast(), localname)
+        HTMLCollection::by_tag_name(&window, self.upcast(), localname)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
@@ -1575,13 +1448,13 @@ impl ElementMethods for Element {
                               localname: DOMString)
                               -> Root<HTMLCollection> {
         let window = window_from_node(self);
-        HTMLCollection::by_tag_name_ns(window.r(), self.upcast(), localname, maybe_ns)
+        HTMLCollection::by_tag_name_ns(&window, self.upcast(), localname, maybe_ns)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
     fn GetElementsByClassName(&self, classes: DOMString) -> Root<HTMLCollection> {
         let window = window_from_node(self);
-        HTMLCollection::by_class_name(window.r(), self.upcast(), classes)
+        HTMLCollection::by_class_name(&window, self.upcast(), classes)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
@@ -1589,20 +1462,20 @@ impl ElementMethods for Element {
         let win = window_from_node(self);
         let raw_rects = self.upcast::<Node>().content_boxes();
         let rects = raw_rects.iter().map(|rect| {
-            DOMRect::new(GlobalRef::Window(win.r()),
+            DOMRect::new(win.upcast(),
                          rect.origin.x.to_f64_px(),
                          rect.origin.y.to_f64_px(),
                          rect.size.width.to_f64_px(),
                          rect.size.height.to_f64_px())
         });
-        DOMRectList::new(win.r(), rects)
+        DOMRectList::new(&win, rects)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
     fn GetBoundingClientRect(&self) -> Root<DOMRect> {
         let win = window_from_node(self);
         let rect = self.upcast::<Node>().bounding_content_box();
-        DOMRect::new(GlobalRef::Window(win.r()),
+        DOMRect::new(win.upcast(),
                      rect.origin.x.to_f64_px(),
                      rect.origin.y.to_f64_px(),
                      rect.size.width.to_f64_px(),
@@ -1912,7 +1785,7 @@ impl ElementMethods for Element {
             // Step 4.
             NodeTypeId::DocumentFragment => {
                 let body_elem = Element::create(QualName::new(ns!(html), atom!("body")),
-                                                None, context_document.r(),
+                                                None, &context_document,
                                                 ElementCreator::ScriptCreated);
                 Root::upcast(body_elem)
             },
@@ -1939,7 +1812,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-parentnode-children
     fn Children(&self) -> Root<HTMLCollection> {
         let window = window_from_node(self);
-        HTMLCollection::children(window.r(), self.upcast())
+        HTMLCollection::children(&window, self.upcast())
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
@@ -2639,8 +2512,6 @@ impl Element {
             return;
         }
         for ancestor in node.ancestors() {
-            let ancestor = ancestor;
-            let ancestor = ancestor.r();
             if !ancestor.is::<HTMLFieldSetElement>() {
                 continue;
             }

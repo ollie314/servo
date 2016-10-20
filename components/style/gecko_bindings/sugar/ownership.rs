@@ -162,6 +162,20 @@ impl<T> Strong<T> {
     }
 
     #[inline]
+    /// Given a reference to a strong FFI reference,
+    /// converts it to a reference to a servo-side Arc
+    /// Returns None on null.
+    ///
+    /// Strong<GeckoType> -> Arc<ServoType>
+    pub fn as_arc_opt<U>(&self) -> Option<&Arc<U>> where U: HasArcFFI<FFIType = T> {
+        if self.is_null() {
+            None
+        } else {
+            unsafe { Some(transmute(self)) }
+        }
+    }
+
+    #[inline]
     /// Produces a null strong FFI reference
     pub fn null() -> Self {
         unsafe { transmute(ptr::null::<T>()) }
@@ -204,7 +218,7 @@ pub struct Owned<T> {
 
 impl<T> Owned<T> {
     /// Owned<GeckoType> -> Box<ServoType>
-    pub fn into_box<U>(self) -> Box<T> where U: HasBoxFFI<FFIType = T> {
+    pub fn into_box<U>(self) -> Box<U> where U: HasBoxFFI<FFIType = T> {
         unsafe { transmute(self) }
     }
     pub fn maybe(self) -> OwnedOrNull<T> {
@@ -238,7 +252,7 @@ impl<T> OwnedOrNull<T> {
         self.ptr == ptr::null_mut()
     }
     /// OwnedOrNull<GeckoType> -> Option<Box<ServoType>>
-    pub fn into_box_opt<U>(self) -> Option<Box<T>> where U: HasBoxFFI<FFIType = T> {
+    pub fn into_box_opt<U>(self) -> Option<Box<U>> where U: HasBoxFFI<FFIType = T> {
         if self.is_null() {
             None
         } else {

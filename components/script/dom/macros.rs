@@ -145,7 +145,7 @@ macro_rules! make_string_or_document_url_getter(
 
 #[macro_export]
 macro_rules! make_enumerated_getter(
-    ( $attr:ident, $htmlname:tt, $default:expr, $(($choices: pat))|+) => (
+    ( $attr:ident, $htmlname:tt, $default:expr, $($choices: pat)|+) => (
         fn $attr(&self) -> DOMString {
             use dom::bindings::inheritance::Castable;
             use dom::element::Element;
@@ -472,6 +472,7 @@ macro_rules! global_event_handlers(
         event_handler!(suspend, GetOnsuspend, SetOnsuspend);
         event_handler!(timeupdate, GetOntimeupdate, SetOntimeupdate);
         event_handler!(toggle, GetOntoggle, SetOntoggle);
+        event_handler!(transitionend, GetOntransitionend, SetOntransitionend);
         event_handler!(volumechange, GetOnvolumechange, SetOnvolumechange);
         event_handler!(waiting, GetOnwaiting, SetOnwaiting);
     )

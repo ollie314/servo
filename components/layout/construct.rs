@@ -22,7 +22,7 @@ use floats::FloatKind;
 use flow::{self, AbsoluteDescendants, IS_ABSOLUTELY_POSITIONED, ImmutableFlowUtils};
 use flow::{CAN_BE_FRAGMENTED, MutableFlowUtils, MutableOwnedFlowUtils};
 use flow_ref::{self, FlowRef};
-use fragment::{CanvasFragmentInfo, ImageFragmentInfo, InlineAbsoluteFragmentInfo};
+use fragment::{CanvasFragmentInfo, ImageFragmentInfo, InlineAbsoluteFragmentInfo, SvgFragmentInfo};
 use fragment::{Fragment, GeneratedContentInfo, IframeFragmentInfo};
 use fragment::{InlineAbsoluteHypotheticalFragmentInfo, TableColumnFragmentInfo};
 use fragment::{InlineBlockFragmentInfo, SpecificFragmentInfo, UnscannedTextFragmentInfo};
@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use style::computed_values::{caption_side, display, empty_cells, float, list_style_position};
+use style::computed_values::{caption_side, display, empty_cells, float, list_style_image, list_style_position};
 use style::computed_values::content::ContentItem;
 use style::computed_values::position;
 use style::context::SharedStyleContext;
@@ -335,6 +335,10 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
                 let data = node.canvas_data().unwrap();
                 SpecificFragmentInfo::Canvas(box CanvasFragmentInfo::new(node, data, self.style_context()))
             }
+            Some(LayoutNodeType::Element(LayoutElementType::SVGSVGElement)) => {
+                let data = node.svg_data().unwrap();
+                SpecificFragmentInfo::Svg(box SvgFragmentInfo::new(node, data, self.style_context()))
+            }
             _ => {
                 // This includes pseudo-elements.
                 SpecificFragmentInfo::Generic
@@ -472,14 +476,9 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
         {
             // FIXME(#6503): Use Arc::get_mut().unwrap() here.
             let inline_flow = flow_ref::deref_mut(&mut inline_flow_ref).as_mut_inline();
-
-
-            let (ascent, descent) =
-                inline_flow.compute_minimum_ascent_and_descent(&mut self.layout_context
-                                                                        .font_context(),
-                                                               &node.style(self.style_context()));
-            inline_flow.minimum_block_size_above_baseline = ascent;
-            inline_flow.minimum_depth_below_baseline = descent;
+            inline_flow.minimum_line_metrics =
+                inline_flow.minimum_line_metrics(&mut self.layout_context.font_context(),
+                                                 &node.style(self.style_context()))
         }
 
         inline_flow_ref.finish();
@@ -1265,14 +1264,14 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
     fn build_flow_for_list_item(&mut self, node: &ConcreteThreadSafeLayoutNode, flotation: float::T)
                                 -> ConstructionResult {
         let flotation = FloatKind::from_property(flotation);
-        let marker_fragments = match node.style(self.style_context()).get_list().list_style_image.0 {
-            Some(ref url) => {
+        let marker_fragments = match node.style(self.style_context()).get_list().list_style_image {
+            list_style_image::T::Url(ref url, ref _extra_data) => {
                 let image_info = box ImageFragmentInfo::new(node,
                                                             Some((*url).clone()),
                                                             &self.layout_context.shared);
                 vec![Fragment::new(node, SpecificFragmentInfo::Image(image_info), self.layout_context)]
             }
-            None => {
+            list_style_image::T::None => {
                 match ListStyleTypeContent::from_list_style_type(node.style(self.style_context())
                                                                      .get_list()
                                                                      .list_style_type) {
@@ -1414,7 +1413,7 @@ impl<'a, ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode>
         let result = {
             let mut style = node.style(self.style_context());
             let mut data = node.mutate_layout_data().unwrap();
-            let damage = data.restyle_damage;
+            let damage = data.base.restyle_damage;
 
             match *node.construction_result_mut(&mut *data) {
                 ConstructionResult::None => true,
@@ -1701,7 +1700,8 @@ impl<ConcreteThreadSafeLayoutNode> NodeUtils for ConcreteThreadSafeLayoutNode
             Some(LayoutNodeType::Document) |
             Some(LayoutNodeType::Element(LayoutElementType::HTMLImageElement)) |
             Some(LayoutNodeType::Element(LayoutElementType::HTMLIFrameElement)) |
-            Some(LayoutNodeType::Element(LayoutElementType::HTMLCanvasElement)) => true,
+            Some(LayoutNodeType::Element(LayoutElementType::HTMLCanvasElement)) |
+            Some(LayoutNodeType::Element(LayoutElementType::SVGSVGElement)) => true,
             Some(LayoutNodeType::Element(LayoutElementType::HTMLObjectElement)) => self.has_object_data(),
             Some(LayoutNodeType::Element(_)) => false,
             None => self.get_pseudo_element_type().is_replaced_content(),

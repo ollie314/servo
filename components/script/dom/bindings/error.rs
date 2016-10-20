@@ -8,9 +8,9 @@ use dom::bindings::codegen::Bindings::DOMExceptionBinding::DOMExceptionMethods;
 use dom::bindings::codegen::PrototypeList::proto_id_to_name;
 use dom::bindings::conversions::{ConversionResult, FromJSValConvertible, ToJSValConvertible};
 use dom::bindings::conversions::root_from_object;
-use dom::bindings::global::{GlobalRef, global_root_from_context};
 use dom::bindings::str::USVString;
 use dom::domexception::{DOMErrorName, DOMException};
+use dom::globalscope::GlobalScope;
 use js::error::{throw_range_error, throw_type_error};
 use js::jsapi::HandleObject;
 use js::jsapi::JSContext;
@@ -87,7 +87,7 @@ pub type Fallible<T> = Result<T, Error>;
 pub type ErrorResult = Fallible<()>;
 
 /// Set a pending exception for the given `result` on `cx`.
-pub unsafe fn throw_dom_exception(cx: *mut JSContext, global: GlobalRef, result: Error) {
+pub unsafe fn throw_dom_exception(cx: *mut JSContext, global: &GlobalScope, result: Error) {
     let code = match result {
         Error::IndexSize => DOMErrorName::IndexSizeError,
         Error::NotFound => DOMErrorName::NotFoundError,
@@ -202,52 +202,52 @@ impl ErrorInfo {
 /// The `dispatch_event` argument is temporary and non-standard; passing false
 /// prevents dispatching the `error` event.
 pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool) {
-    if JS_IsExceptionPending(cx) {
-        rooted!(in(cx) let mut value = UndefinedValue());
-        if !JS_GetPendingException(cx, value.handle_mut()) {
-            JS_ClearPendingException(cx);
-            error!("Uncaught exception: JS_GetPendingException failed");
-            return;
-        }
+    if !JS_IsExceptionPending(cx) { return; }
 
+    rooted!(in(cx) let mut value = UndefinedValue());
+    if !JS_GetPendingException(cx, value.handle_mut()) {
         JS_ClearPendingException(cx);
-        let error_info = if value.is_object() {
-            rooted!(in(cx) let object = value.to_object());
-            let error_info = ErrorInfo::from_native_error(cx, object.handle())
-                .or_else(|| ErrorInfo::from_dom_exception(object.handle()));
-            match error_info {
-                Some(error_info) => error_info,
-                None => {
-                    error!("Uncaught exception: failed to extract information");
-                    return;
-                }
-            }
-        } else {
-            match USVString::from_jsval(cx, value.handle(), ()) {
-                Ok(ConversionResult::Success(USVString(string))) => {
-                    ErrorInfo {
-                        message: format!("uncaught exception: {}", string),
-                        filename: String::new(),
-                        lineno: 0,
-                        column: 0,
-                    }
-                },
-                _ => {
-                    panic!("Uncaught exception: failed to stringify primitive");
-                },
-            }
-        };
+        error!("Uncaught exception: JS_GetPendingException failed");
+        return;
+    }
 
-        error!("Error at {}:{}:{} {}",
-               error_info.filename,
-               error_info.lineno,
-               error_info.column,
-               error_info.message);
-
-        if dispatch_event {
-            let global = global_root_from_context(cx);
-            global.r().report_an_error(error_info, value.handle());
+    JS_ClearPendingException(cx);
+    let error_info = if value.is_object() {
+        rooted!(in(cx) let object = value.to_object());
+        let error_info = ErrorInfo::from_native_error(cx, object.handle())
+            .or_else(|| ErrorInfo::from_dom_exception(object.handle()));
+        match error_info {
+            Some(error_info) => error_info,
+            None => {
+                error!("Uncaught exception: failed to extract information");
+                return;
+            }
         }
+    } else {
+        match USVString::from_jsval(cx, value.handle(), ()) {
+            Ok(ConversionResult::Success(USVString(string))) => {
+                ErrorInfo {
+                    message: format!("uncaught exception: {}", string),
+                    filename: String::new(),
+                    lineno: 0,
+                    column: 0,
+                }
+            },
+            _ => {
+                panic!("Uncaught exception: failed to stringify primitive");
+            },
+        }
+    };
+
+    error!("Error at {}:{}:{} {}",
+           error_info.filename,
+           error_info.lineno,
+           error_info.column,
+           error_info.message);
+
+    if dispatch_event {
+        GlobalScope::from_context(cx)
+            .report_an_error(error_info, value.handle());
     }
 }
 
@@ -270,7 +270,7 @@ pub unsafe fn throw_invalid_this(cx: *mut JSContext, proto_id: u16) {
 
 impl Error {
     /// Convert this error value to a JS value, consuming it in the process.
-    pub unsafe fn to_jsval(self, cx: *mut JSContext, global: GlobalRef, rval: MutableHandleValue) {
+    pub unsafe fn to_jsval(self, cx: *mut JSContext, global: &GlobalScope, rval: MutableHandleValue) {
         assert!(!JS_IsExceptionPending(cx));
         throw_dom_exception(cx, global, self);
         assert!(JS_IsExceptionPending(cx));

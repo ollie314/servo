@@ -26,11 +26,22 @@
 #![cfg_attr(feature = "servo", feature(custom_attribute))]
 #![cfg_attr(feature = "servo", feature(custom_derive))]
 #![cfg_attr(feature = "servo", feature(plugin))]
+#![cfg_attr(feature = "servo", feature(proc_macro))]
+#![cfg_attr(feature = "servo", feature(rustc_attrs))]
+#![cfg_attr(feature = "servo", feature(structural_match))]
 #![cfg_attr(feature = "servo", plugin(heapsize_plugin))]
 #![cfg_attr(feature = "servo", plugin(plugins))]
-#![cfg_attr(feature = "servo", plugin(serde_macros))]
 
-#![deny(unsafe_code)]
+#![deny(warnings)]
+
+// FIXME(bholley): We need to blanket-allow unsafe code in order to make the
+// gecko atom!() macro work. When Rust 1.14 is released [1], we can uncomment
+// the commented-out attributes in regen_atoms.py and go back to denying unsafe
+// code by default.
+//
+// [1] https://github.com/rust-lang/rust/issues/15701#issuecomment-251900615
+//#![deny(unsafe_code)]
+#![allow(unused_unsafe)]
 
 #![recursion_limit = "500"]  // For match_ignore_ascii_case in PropertyDeclaration::parse
 
@@ -51,16 +62,18 @@ extern crate heapsize;
 #[allow(unused_extern_crates)]
 #[macro_use]
 extern crate lazy_static;
-extern crate libc;
+#[cfg(feature = "gecko")] extern crate libc;
 #[macro_use]
 extern crate log;
 #[allow(unused_extern_crates)]
 #[macro_use]
 extern crate matches;
+#[cfg(feature = "gecko")] extern crate nsstring_vendor as nsstring;
 extern crate num_integer;
 extern crate num_traits;
 #[cfg(feature = "gecko")] extern crate num_cpus;
 extern crate ordered_float;
+extern crate owning_ref;
 extern crate parking_lot;
 extern crate quickersort;
 extern crate rand;
@@ -68,6 +81,7 @@ extern crate rustc_serialize;
 extern crate selectors;
 #[cfg(feature = "servo")]
 extern crate serde;
+#[cfg(feature = "servo")] #[macro_use] extern crate serde_derive;
 extern crate smallvec;
 #[cfg(feature = "servo")] #[macro_use] extern crate string_cache;
 #[macro_use]
@@ -99,6 +113,7 @@ pub mod keyframes;
 pub mod logical_geometry;
 pub mod matching;
 pub mod media_queries;
+pub mod owning_handle;
 pub mod parallel;
 pub mod parser;
 pub mod refcell;

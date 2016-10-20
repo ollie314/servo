@@ -43,7 +43,7 @@ use gfx_traits::ByteIndex;
 use msg::constellation_msg::PipelineId;
 use parking_lot::RwLock;
 use range::Range;
-use script_layout_interface::{HTMLCanvasData, LayoutNodeType, TrustedNodeAddress};
+use script_layout_interface::{HTMLCanvasData, LayoutNodeType, SVGSVGData, TrustedNodeAddress};
 use script_layout_interface::{OpaqueStyleAndLayoutData, PartialPersistentLayoutData};
 use script_layout_interface::restyle_damage::RestyleDamage;
 use script_layout_interface::wrapper_traits::{DangerousThreadSafeLayoutNode, LayoutNode, PseudoElementType};
@@ -52,14 +52,15 @@ use selectors::matching::ElementFlags;
 use selectors::parser::{AttrSelector, NamespaceConstraint};
 use std::fmt;
 use std::marker::PhantomData;
-use std::mem::transmute;
+use std::mem::{replace, transmute};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use string_cache::{Atom, Namespace};
 use style::atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
 use style::attr::AttrValue;
 use style::computed_values::display;
 use style::context::SharedStyleContext;
-use style::data::PersistentStyleData;
+use style::data::{PersistentStyleData, PseudoStyles};
 use style::dom::{LayoutIterator, NodeInfo, OpaqueNode, PresentationalHintsSynthetizer, TDocument, TElement, TNode};
 use style::dom::UnsafeNode;
 use style::element_state::*;
@@ -104,6 +105,14 @@ impl<'ln> ServoLayoutNode<'ln> {
             node: *node,
             chain: self.chain,
         }
+    }
+
+    pub fn borrow_data(&self) -> Option<AtomicRef<PersistentStyleData>> {
+        self.get_style_data().map(|d| d.borrow())
+    }
+
+    pub fn mutate_data(&self) -> Option<AtomicRefMut<PersistentStyleData>> {
+        self.get_style_data().map(|d| d.borrow_mut())
     }
 
     fn script_type_id(&self) -> NodeTypeId {
@@ -221,12 +230,33 @@ impl<'ln> TNode for ServoLayoutNode<'ln> {
         self.node.set_flag(CAN_BE_FRAGMENTED, value)
     }
 
-    fn borrow_data(&self) -> Option<AtomicRef<PersistentStyleData>> {
-        self.get_style_data().map(|d| d.borrow())
+    fn store_children_to_process(&self, n: isize) {
+        let data = self.get_partial_layout_data().unwrap().borrow();
+        data.parallel.children_to_process.store(n, Ordering::Relaxed);
     }
 
-    fn mutate_data(&self) -> Option<AtomicRefMut<PersistentStyleData>> {
-        self.get_style_data().map(|d| d.borrow_mut())
+    fn did_process_child(&self) -> isize {
+        let data = self.get_partial_layout_data().unwrap().borrow();
+        let old_value = data.parallel.children_to_process.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(old_value >= 1);
+        old_value - 1
+    }
+
+    fn get_existing_style(&self) -> Option<Arc<ComputedValues>> {
+        self.borrow_data().and_then(|x| x.style.clone())
+    }
+
+    fn set_style(&self, style: Option<Arc<ComputedValues>>) {
+        self.mutate_data().unwrap().style = style;
+    }
+
+    fn take_pseudo_styles(&self) -> PseudoStyles {
+        replace(&mut self.mutate_data().unwrap().per_pseudo, PseudoStyles::default())
+    }
+
+    fn set_pseudo_styles(&self, styles: PseudoStyles) {
+        debug_assert!(self.borrow_data().unwrap().per_pseudo.is_empty());
+        self.mutate_data().unwrap().per_pseudo = styles;
     }
 
     fn restyle_damage(self) -> RestyleDamage {
@@ -380,7 +410,7 @@ impl<'ln> ServoLayoutNode<'ln> {
 
     /// Returns the interior of this node as a `LayoutJS`. This is highly unsafe for layout to
     /// call and as such is marked `unsafe`.
-    unsafe fn get_jsmanaged(&self) -> &LayoutJS<Node> {
+    pub unsafe fn get_jsmanaged(&self) -> &LayoutJS<Node> {
         &self.node
     }
 }
@@ -859,6 +889,11 @@ impl<'ln> ThreadSafeLayoutNode for ServoThreadSafeLayoutNode<'ln> {
     fn canvas_data(&self) -> Option<HTMLCanvasData> {
         let this = unsafe { self.get_jsmanaged() };
         this.canvas_data()
+    }
+
+    fn svg_data(&self) -> Option<SVGSVGData> {
+        let this = unsafe { self.get_jsmanaged() };
+        this.svg_data()
     }
 
     fn iframe_pipeline_id(&self) -> PipelineId {

@@ -6,7 +6,7 @@
 
 
 use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
-use data::PersistentStyleData;
+use data::{PersistentStyleData, PseudoStyles};
 use dom::{LayoutIterator, NodeInfo, TDocument, TElement, TNode, TRestyleDamage, UnsafeNode};
 use dom::{OpaqueNode, PresentationalHintsSynthetizer};
 use element_state::ElementState;
@@ -30,7 +30,7 @@ use gecko_bindings::structs::{NODE_HAS_DIRTY_DESCENDANTS_FOR_SERVO, NODE_IS_DIRT
 use gecko_bindings::structs::{RawGeckoDocument, RawGeckoElement, RawGeckoNode};
 use gecko_bindings::structs::{nsChangeHint, nsIAtom, nsIContent, nsStyleContext};
 use gecko_bindings::structs::OpaqueStyleData;
-use gecko_bindings::sugar::ownership::{FFIArcHelpers, HasArcFFI, HasFFI};
+use gecko_bindings::sugar::ownership::FFIArcHelpers;
 use libc::uintptr_t;
 use parking_lot::RwLock;
 use parser::ParserContextExtraData;
@@ -45,7 +45,6 @@ use std::fmt;
 use std::ops::BitOr;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr};
 use string_cache::{Atom, Namespace, WeakAtom, WeakNamespace};
 use url::Url;
 
@@ -56,25 +55,6 @@ impl NonOpaqueStyleData {
         NonOpaqueStyleData(AtomicRefCell::new(PersistentStyleData::new()))
     }
 }
-
-
-pub struct GeckoDeclarationBlock {
-    pub declarations: Option<Arc<RwLock<PropertyDeclarationBlock>>>,
-    // XXX The following two fields are made atomic to work around the
-    // ownership system so that they can be changed inside a shared
-    // instance. It wouldn't provide safety as Rust usually promises,
-    // but it is fine as far as we only access them in a single thread.
-    // If we need to access them in different threads, we would need
-    // to redesign how it works with MiscContainer in Gecko side.
-    pub cache: AtomicPtr<bindings::nsHTMLCSSStyleSheet>,
-    pub immutable: AtomicBool,
-}
-
-unsafe impl HasFFI for GeckoDeclarationBlock {
-    type FFIType = bindings::ServoDeclarationBlock;
-}
-unsafe impl HasArcFFI for GeckoDeclarationBlock {}
-
 
 // We can eliminate OpaqueStyleData when the bindings move into the style crate.
 fn to_opaque_style_data(d: *mut NonOpaqueStyleData) -> *mut OpaqueStyleData {
@@ -94,7 +74,6 @@ pub struct GeckoNode<'ln>(pub &'ln RawGeckoNode);
 
 impl<'ln> GeckoNode<'ln> {
     fn from_content(content: &'ln nsIContent) -> Self {
-        use std::mem;
         GeckoNode(&content._base)
     }
 
@@ -140,6 +119,20 @@ impl<'ln> GeckoNode<'ln> {
             self.0.mServoData.set(ptr::null_mut());
         }
     }
+
+    pub fn get_pseudo_style(&self, pseudo: &PseudoElement) -> Option<Arc<ComputedValues>> {
+        self.borrow_data().and_then(|data| data.per_pseudo.get(pseudo).map(|c| c.clone()))
+    }
+
+    #[inline(always)]
+    fn borrow_data(&self) -> Option<AtomicRef<PersistentStyleData>> {
+        self.get_node_data().as_ref().map(|d| d.0.borrow())
+    }
+
+    #[inline(always)]
+    fn mutate_data(&self) -> Option<AtomicRefMut<PersistentStyleData>> {
+        self.get_node_data().as_ref().map(|d| d.0.borrow_mut())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,7 +171,7 @@ impl BitOr for GeckoRestyleDamage {
 impl<'ln> NodeInfo for GeckoNode<'ln> {
     fn is_element(&self) -> bool {
         use gecko_bindings::structs::nsINode_BooleanFlag;
-        self.0.mBoolFlags & nsINode_BooleanFlag::NodeIsElement as u32 != 0
+        self.0.mBoolFlags & (1u32 << nsINode_BooleanFlag::NodeIsElement as u32) != 0
     }
 
     fn is_text_node(&self) -> bool {
@@ -302,14 +295,32 @@ impl<'ln> TNode for GeckoNode<'ln> {
         // Maybe this isn’t useful for Gecko?
     }
 
-    #[inline(always)]
-    fn borrow_data(&self) -> Option<AtomicRef<PersistentStyleData>> {
-        self.get_node_data().as_ref().map(|d| d.0.borrow())
+    fn store_children_to_process(&self, _: isize) {
+        // This is only used for bottom-up traversal, and is thus a no-op for Gecko.
     }
 
-    #[inline(always)]
-    fn mutate_data(&self) -> Option<AtomicRefMut<PersistentStyleData>> {
-        self.get_node_data().as_ref().map(|d| d.0.borrow_mut())
+    fn did_process_child(&self) -> isize {
+        panic!("Atomic child count not implemented in Gecko");
+    }
+
+    fn get_existing_style(&self) -> Option<Arc<ComputedValues>> {
+        self.borrow_data().and_then(|x| x.style.clone())
+    }
+
+    fn set_style(&self, style: Option<Arc<ComputedValues>>) {
+        self.mutate_data().unwrap().style = style;
+    }
+
+    fn take_pseudo_styles(&self) -> PseudoStyles {
+        use std::mem;
+        let mut tmp = PseudoStyles::default();
+        mem::swap(&mut tmp, &mut self.mutate_data().unwrap().per_pseudo);
+        tmp
+    }
+
+    fn set_pseudo_styles(&self, styles: PseudoStyles) {
+        debug_assert!(self.borrow_data().unwrap().per_pseudo.is_empty());
+        self.mutate_data().unwrap().per_pseudo = styles;
     }
 
     fn restyle_damage(self) -> Self::ConcreteRestyleDamage {
@@ -397,8 +408,8 @@ impl<'a> Iterator for GeckoChildrenIterator<'a> {
                 *self = GeckoChildrenIterator::Current(next);
                 curr
             },
-            GeckoChildrenIterator::GeckoIterator(ref it) => unsafe {
-                Gecko_GetNextStyleChild(&it).map(GeckoNode)
+            GeckoChildrenIterator::GeckoIterator(ref mut it) => unsafe {
+                Gecko_GetNextStyleChild(it).map(GeckoNode)
             }
         }
     }
@@ -445,13 +456,13 @@ impl<'le> fmt::Debug for GeckoElement<'le> {
 }
 
 impl<'le> GeckoElement<'le> {
-    pub fn parse_style_attribute(value: &str) -> Option<PropertyDeclarationBlock> {
+    pub fn parse_style_attribute(value: &str) -> PropertyDeclarationBlock {
         // FIXME(bholley): Real base URL and error reporter.
         let base_url = &*DUMMY_BASE_URL;
         // FIXME(heycam): Needs real ParserContextExtraData so that URLs parse
         // properly.
         let extra_data = ParserContextExtraData::default();
-        Some(parse_style_attribute(value, &base_url, Box::new(StdoutErrorReporter), extra_data))
+        parse_style_attribute(value, &base_url, Box::new(StdoutErrorReporter), extra_data)
     }
 }
 
@@ -471,12 +482,7 @@ impl<'le> TElement for GeckoElement<'le> {
 
     fn style_attribute(&self) -> Option<&Arc<RwLock<PropertyDeclarationBlock>>> {
         let declarations = unsafe { Gecko_GetServoDeclarationBlock(self.0) };
-        if declarations.is_none() {
-            None
-        } else {
-            let declarations = GeckoDeclarationBlock::arc_from_borrowed(&declarations).unwrap();
-            declarations.declarations.as_ref().map(|r| r as *const Arc<_>).map(|ptr| unsafe { &*ptr })
-        }
+        declarations.map(|s| s.as_arc_opt()).unwrap_or(None)
     }
 
     fn get_state(&self) -> ElementState {
